@@ -10,15 +10,41 @@ fn generate_brotli_assets() {
     use std::fs;
     use std::io::{Read, Write};
     use std::path::PathBuf;
+    use std::process::Command;
     use walkdir::WalkDir;
 
-    println!("cargo:rerun-if-changed=web/dist");
-
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let dist_dir = manifest_dir.join("web").join("dist");
+    let web_dir = manifest_dir.join("web");
+    let dist_dir = web_dir.join("dist");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let asset_dir = out_dir.join("web_assets");
     let generated = out_dir.join("generated_assets.rs");
+
+    // Monitor web directory for changes
+    println!("cargo:rerun-if-changed=web/src");
+    println!("cargo:rerun-if-changed=web/index.html");
+    println!("cargo:rerun-if-changed=web/package.json");
+    println!("cargo:rerun-if-changed=web/vite.config.ts");
+    println!("cargo:rerun-if-changed=web/tsconfig.json");
+
+    // Run npm install and npm run build
+    let status = Command::new("npm")
+        .args(["install"])
+        .current_dir(&web_dir)
+        .status()
+        .expect("failed to run npm install");
+    if !status.success() {
+        panic!("npm install failed");
+    }
+
+    let status = Command::new("npm")
+        .args(["run", "build"])
+        .current_dir(&web_dir)
+        .status()
+        .expect("failed to run npm run build");
+    if !status.success() {
+        panic!("npm run build failed");
+    }
 
     fs::create_dir_all(&asset_dir).unwrap();
 
@@ -30,8 +56,6 @@ fn generate_brotli_assets() {
             .filter(|entry| entry.file_type().is_file())
         {
             let path = entry.path();
-            println!("cargo:rerun-if-changed={}", path.display());
-
             let relative = path.strip_prefix(&dist_dir).unwrap();
             let route = format!("/{}", relative.to_string_lossy().replace('\\', "/"));
             let safe_name = route
@@ -52,13 +76,7 @@ fn generate_brotli_assets() {
     }
 
     if entries.is_empty() {
-        let fallback = br#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESP32-S3</title></head><body><h1>Build web/ first</h1><p>Run npm install && npm run build in web/, then rebuild the firmware.</p></body></html>"#;
-        let compressed_path = asset_dir.join("index_html.br");
-        let mut compressed = Vec::new();
-        let mut compressor = CompressorReader::new(fallback.as_slice(), 4096, 11, 22);
-        compressor.read_to_end(&mut compressed).unwrap();
-        fs::write(&compressed_path, compressed).unwrap();
-        entries.push(("/index.html".to_string(), "text/html; charset=utf-8", compressed_path));
+        panic!("No assets found in web/dist after build");
     }
 
     entries.sort_by(|left, right| left.0.cmp(&right.0));

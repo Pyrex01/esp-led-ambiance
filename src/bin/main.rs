@@ -178,23 +178,24 @@ impl<State> PathRouterService<State> for EmbeddedAssets {
         W: ResponseWriter<Error = R::Error>,
     {
         match request.parts.method() {
-            "GET" | "HEAD" => match find_asset(path.encoded()) {
-                Some(asset) => {
-                    (
-                        ("Content-Encoding", "br"),
-                        ("Vary", "Accept-Encoding"),
-                        ("Cache-Control", "public, max-age=31536000, immutable"),
-                        EncodedAsset(asset),
-                    )
-                        .write_to(request.body_connection.finalize().await?, response_writer)
-                        .await
-                }
-                None => {
-                    (StatusCode::NOT_FOUND, "Not Found")
-                        .write_to(request.body_connection.finalize().await?, response_writer)
-                        .await
-                }
-            },
+            "GET" | "HEAD" => {
+                let asset = find_asset(path.encoded()).unwrap_or_else(|| {
+                    // Fallback to index.html for SPA routing
+                    ASSETS
+                        .iter()
+                        .find(|a| a.path == "/index.html")
+                        .expect("index.html must exist")
+                });
+
+                (
+                    ("Content-Encoding", "br"),
+                    ("Vary", "Accept-Encoding"),
+                    ("Cache-Control", "public, max-age=31536000, immutable"),
+                    EncodedAsset(asset),
+                )
+                    .write_to(request.body_connection.finalize().await?, response_writer)
+                    .await
+            }
             _ => {
                 (StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
                     .write_to(request.body_connection.finalize().await?, response_writer)

@@ -1,14 +1,15 @@
 fn main() {
     linker_be_nice();
-    generate_brotli_assets();
+    generate_assets();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
 }
 
-fn generate_brotli_assets() {
-    use brotli::CompressorReader;
+fn generate_assets() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::path::PathBuf;
     use std::process::Command;
     use walkdir::WalkDir;
@@ -63,12 +64,12 @@ fn generate_brotli_assets() {
                 .chars()
                 .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
                 .collect::<String>();
-            let compressed_path = asset_dir.join(format!("{safe_name}.br"));
+            let compressed_path = asset_dir.join(format!("{safe_name}.gz"));
 
             let bytes = fs::read(path).unwrap();
-            let mut compressed = Vec::new();
-            let mut compressor = CompressorReader::new(bytes.as_slice(), 4096, 11, 22);
-            compressor.read_to_end(&mut compressed).unwrap();
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+            encoder.write_all(&bytes).unwrap();
+            let compressed = encoder.finish().unwrap();
             fs::write(&compressed_path, compressed).unwrap();
 
             entries.push((route, content_type(path), compressed_path));

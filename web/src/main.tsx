@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import "./style.css";
 
 const stats = [
-  ["Serving", "Brotli assets from flash"],
+  ["Serving", "Gzip assets from flash"],
   ["Network", "Station mode over local Wi-Fi"],
   ["Runtime", "Rust + Embassy on ESP32-S3"]
 ];
@@ -16,9 +16,9 @@ function App() {
           <p className="eyebrow">ESP32-S3 WROOM-1</p>
           <h1>React UI served by Rust firmware</h1>
           <p className="summary">
-            This page was built by Vite, compressed with Brotli at firmware
+            This page was built by Vite, compressed with Gzip at firmware
             build time, embedded into flash, and returned with
-            <code> Content-Encoding: br</code>.
+            <code> Content-Encoding: gzip</code>.
           </p>
         </div>
 

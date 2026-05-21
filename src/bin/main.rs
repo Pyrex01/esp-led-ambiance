@@ -188,7 +188,7 @@ impl<State> PathRouterService<State> for EmbeddedAssets {
                 });
 
                 (
-                    ("Content-Encoding", "br"),
+                    ("Content-Encoding", "gzip"),
                     ("Vary", "Accept-Encoding"),
                     ("Cache-Control", "public, max-age=31536000, immutable"),
                     EncodedAsset(asset),

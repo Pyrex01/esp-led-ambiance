@@ -31,7 +31,7 @@ static_cell      = "2.1.1"
 picoserve = { version = "0.17.1", default-features = false, features = ["embassy", "log"] }
 
 [build-dependencies]
-brotli   = "8.0.2"
+flate2   = "1.0"
 walkdir  = "2.5.0"
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]

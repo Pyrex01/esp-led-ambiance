@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { createRoot } from "react-dom/client";
-import { Power, Sun, Palette, Wand2, RefreshCw } from "lucide-react";
+import { Power, Sun, Palette, Wand2, Plus, Trash2 } from "lucide-react";
 import "./style.css";
 
 interface LedState {
@@ -10,25 +10,11 @@ interface LedState {
   pattern: number;
 }
 
-const PRESET_COLORS: [number, number, number][] = [
-  [255, 255, 255], // Warm White (approx)
-  [200, 230, 255], // Cool White
-  [255, 0, 0],     // Red
-  [0, 255, 0],     // Green
-  [0, 0, 255],     // Blue
-  [255, 0, 255],   // Purple
-  [255, 165, 0],   // Orange
-  [0, 255, 255],   // Cyan
+const DEFAULT_PRESETS: [number, number, number][] = [
+  [255, 255, 255], [200, 230, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 0, 255], [255, 165, 0], [0, 255, 255],
 ];
 
-const PATTERNS = [
-  "Solid",
-  "Rainbow",
-  "Pulse",
-  "Chase",
-  "Strobe",
-  "Flow",
-];
+const PATTERNS = ["Solid", "Rainbow", "Pulse", "Chase", "Strobe", "Flow"];
 
 function App() {
   const [state, setState] = useState<LedState>({
@@ -38,8 +24,26 @@ function App() {
     pattern: 0,
   });
 
+  const [customColors, setCustomColors] = useState<[number, number, number][]>([]);
   const [connected, setConnected] = useState(false);
   const ws = useRef<WebSocket | null>(null);
+
+  useEffect(() => {
+    const saved = localStorage.getItem("customColors");
+    if (saved) setCustomColors(JSON.parse(saved));
+  }, []);
+
+  const addCustomColor = (color: [number, number, number]) => {
+    const newCustom = [...customColors, color].slice(-5);
+    setCustomColors(newCustom);
+    localStorage.setItem("customColors", JSON.stringify(newCustom));
+  };
+
+  const removeCustomColor = (index: number) => {
+    const newCustom = customColors.filter((_, i) => i !== index);
+    setCustomColors(newCustom);
+    localStorage.setItem("customColors", JSON.stringify(newCustom));
+  };
 
   const connect = useCallback(() => {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -48,14 +52,9 @@ function App() {
     const socket = new WebSocket(url);
     socket.binaryType = "arraybuffer";
 
-    socket.onopen = () => {
-      setConnected(true);
-      console.log("Connected to ESP32");
-    };
-
+    socket.onopen = () => setConnected(true);
     socket.onclose = () => {
       setConnected(false);
-      console.log("Disconnected, retrying...");
       setTimeout(connect, 2000);
     };
 
@@ -89,20 +88,15 @@ function App() {
     });
   };
 
-  const rgbToHex = (r: number, g: number, b: number) => {
-    return "#" + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('');
-  };
-
-  const hexToRgb = (hex: number): [number, number, number] => {
-    const r = (hex >> 16) & 255;
-    const g = (hex >> 8) & 255;
-    const b = hex & 255;
+  const rgbToHex = (r: number, g: number, b: number) => "#" + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('');
+  const hexToRgb = (hex: string): [number, number, number] => {
+    const r = parseInt(hex.substring(1, 3), 16);
+    const g = parseInt(hex.substring(3, 5), 16);
+    const b = parseInt(hex.substring(5, 7), 16);
     return [r, g, b];
   };
 
-  const glowColor = state.power 
-    ? `rgba(${state.color[0]}, ${state.color[1]}, ${state.color[2]}, ${state.brightness / 255})`
-    : "rgba(0, 0, 0, 0.2)";
+  const glowColor = state.power ? `rgba(${state.color[0]}, ${state.color[1]}, ${state.color[2]}, ${state.brightness / 255})` : "rgba(0, 0, 0, 0.2)";
 
   return (
     <main className="shell">
@@ -118,7 +112,7 @@ function App() {
         <section className="visualizer-section">
           <div className="led-square-wrapper">
             <div 
-              className="led-square" 
+              className={`led-square ${state.power && state.pattern !== 0 ? "animating" : ""}`} 
               style={{ 
                 borderColor: rgbToHex(...state.color),
                 boxShadow: `0 0 ${state.brightness / 4}px ${glowColor}, inset 0 0 ${state.brightness / 8}px ${glowColor}`,
@@ -135,10 +129,7 @@ function App() {
 
         <section className="controls-grid">
           <div className="control-card power-card">
-            <button 
-              className={`power-btn ${state.power ? "on" : "off"}`}
-              onClick={() => updateState({ power: !state.power })}
-            >
+            <button className={`power-btn ${state.power ? "on" : "off"}`} onClick={() => updateState({ power: !state.power })}>
               <Power size={32} />
               <span>{state.power ? "Power On" : "Power Off"}</span>
             </button>
@@ -150,38 +141,31 @@ function App() {
               <h3>Brightness</h3>
               <span className="value-label">{Math.round((state.brightness / 255) * 100)}%</span>
             </div>
-            <input 
-              type="range" 
-              min="0" 
-              max="255" 
-              value={state.brightness}
-              onChange={(e) => updateState({ brightness: parseInt(e.target.value) })}
-            />
+            <input type="range" min="0" max="255" value={state.brightness} onChange={(e) => updateState({ brightness: parseInt(e.target.value) })} />
           </div>
 
           <div className="control-card color-card">
             <div className="card-header">
               <Palette size={18} />
-              <h3>Color Presets</h3>
+              <h3>Presets</h3>
             </div>
             <div className="color-grid">
-              {PRESET_COLORS.map((color, i) => (
-                <button
-                  key={i}
-                  className="color-preset"
-                  style={{ backgroundColor: rgbToHex(...color) }}
-                  onClick={() => updateState({ color, power: true })}
-                />
+              {DEFAULT_PRESETS.map((color, i) => (
+                <button key={i} className="color-preset" style={{ backgroundColor: rgbToHex(...color) }} onClick={() => updateState({ color, power: true })} />
+              ))}
+              {customColors.map((color, i) => (
+                <div key={i} className="color-preset-wrapper" style={{ position: 'relative' }}>
+                  <button className="color-preset" style={{ backgroundColor: rgbToHex(...color) }} onClick={() => updateState({ color, power: true })} />
+                  <button className="remove-preset" onClick={() => removeCustomColor(i)}><Trash2 size={10} /></button>
+                </div>
               ))}
               <div className="custom-color-wrapper">
-                <input 
-                  type="color" 
-                  value={rgbToHex(...state.color)}
-                  onChange={(e) => {
-                    const hex = parseInt(e.target.value.substring(1), 16);
-                    updateState({ color: hexToRgb(hex), power: true });
-                  }}
-                />
+                <input type="color" onChange={(e) => {
+                  const color = hexToRgb(e.target.value);
+                  updateState({ color, power: true });
+                  addCustomColor(color);
+                }} />
+                <Plus size={16} />
               </div>
             </div>
           </div>
@@ -193,11 +177,7 @@ function App() {
             </div>
             <div className="pattern-list">
               {PATTERNS.map((name, i) => (
-                <button
-                  key={i}
-                  className={`pattern-btn ${state.pattern === i ? "active" : ""}`}
-                  onClick={() => updateState({ pattern: i, power: true })}
-                >
+                <button key={i} className={`pattern-btn ${state.pattern === i ? "active" : ""}`} onClick={() => updateState({ pattern: i, power: true })}>
                   {name}
                 </button>
               ))}
@@ -209,8 +189,4 @@ function App() {
   );
 }
 
-createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
-);
+createRoot(document.getElementById("root")!).render(<React.StrictMode><App /></React.StrictMode>);

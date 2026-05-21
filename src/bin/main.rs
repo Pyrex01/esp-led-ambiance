@@ -7,21 +7,19 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
-use core::fmt::Write as _;
-use core::str;
-
 use embassy_executor::Spawner;
-use embassy_net::tcp::TcpSocket;
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources};
 use embassy_time::{Duration, Timer};
-use embedded_io_async::Write as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::rng::Rng;
 use esp_hal::timer::timg::TimerGroup;
-use esp_radio::wifi::{sta::StationConfig, Config, Interface, WifiController};
-use heapless::String;
+use esp_radio::wifi::{Config, Interface, WifiController, sta::StationConfig};
 use log::{error, info, warn};
-use practice_esp::assets::{Asset, ASSETS};
+use picoserve::ResponseSent;
+use picoserve::request::{Path, Request};
+use picoserve::response::{Content, IntoResponse, ResponseWriter, StatusCode};
+use picoserve::routing::PathRouterService;
+use practice_esp::assets::{ASSETS, Asset};
 use practice_esp::mk_static;
 
 const SSID: &str = "Enchanter";
@@ -74,45 +72,18 @@ async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
 
 #[embassy_executor::task]
 async fn http_server(stack: Stack<'static>) {
-    let mut rx_buffer = [0; 4096];
-    let mut tx_buffer = [0; 4096];
-    let mut request = [0; 1024];
+    let app = picoserve::Router::from_service(EmbeddedAssets);
+    let config = picoserve::Config::new(picoserve::Timeouts {
+        start_read_request: Some(Duration::from_secs(5)),
+        persistent_start_read_request: Some(Duration::from_secs(1)),
+        read_request: Some(Duration::from_secs(1)),
+        write: Some(Duration::from_secs(5)),
+    });
 
     loop {
-        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-
-        if let Err(err) = socket.accept(80).await {
-            warn!("HTTP accept failed: {:?}", err);
-            Timer::after(Duration::from_millis(250)).await;
-            continue;
-        }
-
-        let read = match socket.read(&mut request).await {
-            Ok(read) if read > 0 => read,
-            Ok(_) => {
-                socket.close();
-                continue;
-            }
-            Err(err) => {
-                warn!("HTTP read failed: {:?}", err);
-                socket.close();
-                continue;
-            }
-        };
-
-        let path = request_path(&request[..read]).unwrap_or("/");
-        let response = find_asset(path);
-
-        let result = match response {
-            Some(asset) => write_asset(&mut socket, asset).await,
-            None => write_404(&mut socket).await,
-        };
-
-        if let Err(err) = result {
-            warn!("HTTP write failed: {:?}", err);
-        }
-
-        socket.close();
+        picoserve::Server::new(&app, &config, &mut [0; 1024])
+            .listen_and_serve("web", stack, 80, &mut [0; 4096], &mut [0; 4096])
+            .await;
     }
 }
 
@@ -176,20 +147,6 @@ async fn wait_for_network(stack: Stack<'_>) {
     }
 }
 
-fn request_path(request: &[u8]) -> Option<&str> {
-    let line_end = request.windows(2).position(|window| window == b"\r\n")?;
-    let line = str::from_utf8(&request[..line_end]).ok()?;
-    let mut parts = line.split_ascii_whitespace();
-    let method = parts.next()?;
-    let path = parts.next()?;
-
-    if method != "GET" && method != "HEAD" {
-        return None;
-    }
-
-    Some(path.split('?').next().unwrap_or("/"))
-}
-
 fn find_asset(path: &str) -> Option<&'static Asset> {
     let normalized = if path == "/" { "/index.html" } else { path };
 
@@ -205,33 +162,60 @@ fn find_asset(path: &str) -> Option<&'static Asset> {
         })
 }
 
-async fn write_asset(
-    socket: &mut TcpSocket<'_>,
-    asset: &Asset,
-) -> Result<(), embassy_net::tcp::Error> {
-    let mut header: String<256> = String::new();
-    write!(
-        header,
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Encoding: br\r\nVary: Accept-Encoding\r\nCache-Control: public, max-age=31536000, immutable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        asset.content_type,
-        asset.bytes.len()
-    )
-    .ok();
+struct EmbeddedAssets;
 
-    socket.write_all(header.as_bytes()).await?;
-    socket.write_all(asset.bytes).await
+impl<State> PathRouterService<State> for EmbeddedAssets {
+    async fn call_request_handler_service<R, W>(
+        &self,
+        _state: &State,
+        _path_parameters: (),
+        path: Path<'_>,
+        request: Request<'_, R>,
+        response_writer: W,
+    ) -> Result<ResponseSent, W::Error>
+    where
+        R: picoserve::io::Read,
+        W: ResponseWriter<Error = R::Error>,
+    {
+        match request.parts.method() {
+            "GET" | "HEAD" => match find_asset(path.encoded()) {
+                Some(asset) => {
+                    (
+                        ("Content-Encoding", "br"),
+                        ("Vary", "Accept-Encoding"),
+                        ("Cache-Control", "public, max-age=31536000, immutable"),
+                        EncodedAsset(asset),
+                    )
+                        .write_to(request.body_connection.finalize().await?, response_writer)
+                        .await
+                }
+                None => {
+                    (StatusCode::NOT_FOUND, "Not Found")
+                        .write_to(request.body_connection.finalize().await?, response_writer)
+                        .await
+                }
+            },
+            _ => {
+                (StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
+                    .write_to(request.body_connection.finalize().await?, response_writer)
+                    .await
+            }
+        }
+    }
 }
 
-async fn write_404(socket: &mut TcpSocket<'_>) -> Result<(), embassy_net::tcp::Error> {
-    const BODY: &[u8] = b"Not Found";
-    let mut header: String<128> = String::new();
-    write!(
-        header,
-        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        BODY.len()
-    )
-    .ok();
+struct EncodedAsset(&'static Asset);
 
-    socket.write_all(header.as_bytes()).await?;
-    socket.write_all(BODY).await
+impl Content for EncodedAsset {
+    fn content_type(&self) -> &'static str {
+        self.0.content_type
+    }
+
+    fn content_length(&self) -> usize {
+        self.0.bytes.len()
+    }
+
+    async fn write_content<W: picoserve::io::Write>(self, mut writer: W) -> Result<(), W::Error> {
+        writer.write_all(self.0.bytes).await
+    }
 }

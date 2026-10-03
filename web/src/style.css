@@ -51,6 +51,11 @@ header {
 
 .status-indicator.online { background: #b9f18f; box-shadow: 0 0 8px #b9f18f; }
 .status-indicator.offline { background: #ff6b6b; box-shadow: 0 0 8px #ff6b6b; }
+.status-indicator.reconnecting { background: #ffd166; box-shadow: 0 0 8px #ffd166; animation: status-pulse 1.2s ease-in-out infinite; }
+
+@keyframes status-pulse {
+  50% { opacity: 0.45; }
+}
 
 .eyebrow {
   margin: 0;
@@ -79,36 +84,57 @@ h1 {
 }
 
 .led-square {
-  width: min(300px, 70vw);
+  width: min(400px, 86vw);
   aspect-ratio: 1;
-  border: 4px solid;
-  border-radius: 24px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  background: rgba(255, 255, 255, 0.02);
+  touch-action: none;
 }
 
-.square-content {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 4px;
+.led-map {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
 }
 
-.meters {
-  font-size: 1.5rem;
+.led-map g {
+  cursor: pointer;
+  outline: none;
+}
+
+.led-hit {
+  fill: transparent;
+  pointer-events: all;
+}
+
+.digital-led {
+  fill: rgba(255, 255, 255, 0.12);
+  pointer-events: none;
+  transition: fill 180ms ease, opacity 180ms ease, r 180ms ease;
+}
+
+.led-connections {
+  fill: none;
+  stroke-width: 2.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.led-map g:focus-visible .led-hit {
+  fill: rgba(255, 255, 255, 0.35);
+}
+
+.square-label, .square-sub-label {
+  fill: rgba(247, 247, 242, 0.75);
+  text-anchor: middle;
+  font-family: inherit;
   font-weight: 700;
+  pointer-events: none;
 }
 
-.strip-type {
-  font-size: 0.7rem;
-  color: rgba(247, 247, 242, 0.4);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-}
+.square-label { font-size: 12px; }
+.square-sub-label { font-size: 8px; letter-spacing: 1px; fill: rgba(247, 247, 242, 0.4); }
+
 
 .controls-grid {
   display: grid;

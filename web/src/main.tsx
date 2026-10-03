@@ -8,7 +8,13 @@ interface LedState {
   color: [number, number, number];
   brightness: number;
   pattern: number;
+  ledMask: number[];
 }
+
+const LEDS_PER_SIDE = 120;
+const LED_COUNT = LEDS_PER_SIDE * 4;
+const LED_MASK_BYTES = LED_COUNT / 8;
+const FULL_LED_MASK = Array<number>(LED_MASK_BYTES).fill(0xff);
 
 const DEFAULT_PRESETS: [number, number, number][] = [
   [255, 255, 255], [200, 230, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 0, 255], [255, 165, 0], [0, 255, 255],
@@ -22,11 +28,13 @@ function App() {
     color: [255, 165, 0],
     brightness: 128,
     pattern: 0,
+    ledMask: FULL_LED_MASK.slice(),
   });
 
   const [customColors, setCustomColors] = useState<[number, number, number][]>([]);
-  const [connected, setConnected] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<"connecting" | "reconnecting" | "connected">("connecting");
   const ws = useRef<WebSocket | null>(null);
+  const stateRef = useRef(state);
 
   useEffect(() => {
     const saved = localStorage.getItem("customColors");
@@ -48,22 +56,66 @@ function App() {
   const connect = useCallback(() => {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${protocol}//${window.location.host}/ws`;
-    
-    const socket = new WebSocket(url);
+    let stopped = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let retryDelay = 1000;
+
+    const openSocket = () => {
+      if (stopped) return;
+      setConnectionStatus((status) => status === "connected" ? "reconnecting" : status);
+      let socket: WebSocket;
+      try {
+        socket = new WebSocket(url);
+      } catch {
+        scheduleRetry();
+        return;
+      }
     socket.binaryType = "arraybuffer";
 
-    socket.onopen = () => setConnected(true);
+      socket.onopen = () => {
+        if (stopped) {
+          socket.close();
+          return;
+        }
+        retryDelay = 1000;
+        ws.current = socket;
+        setConnectionStatus("connected");
+        const current = stateRef.current;
+        socket.send(new Uint8Array([current.power ? 1 : 0, ...current.color, current.brightness, current.pattern, ...current.ledMask]));
+      };
     socket.onclose = () => {
-      setConnected(false);
-      setTimeout(connect, 2000);
+        if (ws.current === socket) ws.current = null;
+        if (stopped) return;
+        setConnectionStatus("reconnecting");
+        scheduleRetry();
     };
+      socket.onerror = () => socket.close();
 
     ws.current = socket;
+    };
+
+    const scheduleRetry = () => {
+      if (stopped || retryTimer) return;
+      setConnectionStatus("reconnecting");
+      retryTimer = setTimeout(() => {
+        retryTimer = undefined;
+        openSocket();
+      }, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 10000);
+    };
+
+    openSocket();
+    return () => {
+      stopped = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      const socket = ws.current;
+      ws.current = null;
+      socket?.close();
+    };
   }, []);
 
   useEffect(() => {
-    connect();
-    return () => ws.current?.close();
+    return connect();
   }, [connect]);
 
   const sendUpdate = useCallback((newState: LedState) => {
@@ -74,18 +126,18 @@ function App() {
         newState.color[1],
         newState.color[2],
         newState.brightness,
-        newState.pattern
+        newState.pattern,
+        ...newState.ledMask,
       ]);
       ws.current.send(packed);
     }
   }, []);
 
   const updateState = (updates: Partial<LedState>) => {
-    setState((prev) => {
-      const newState = { ...prev, ...updates };
-      sendUpdate(newState);
-      return newState;
-    });
+    const newState = { ...stateRef.current, ...updates };
+    stateRef.current = newState;
+    setState(newState);
+    sendUpdate(newState);
   };
 
   const rgbToHex = (r: number, g: number, b: number) => "#" + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('');
@@ -96,33 +148,64 @@ function App() {
     return [r, g, b];
   };
 
-  const glowColor = state.power ? `rgba(${state.color[0]}, ${state.color[1]}, ${state.color[2]}, ${state.brightness / 255})` : "rgba(0, 0, 0, 0.2)";
+  const [traceValue, setTraceValue] = useState<boolean | null>(null);
+  const setLed = (index: number, value?: boolean) => {
+    const mask = stateRef.current.ledMask.slice();
+    const byteIndex = Math.floor(index / 8);
+    const bit = 1 << (index % 8);
+    const currentlyOn = (mask[byteIndex] & bit) !== 0;
+    const turnOn = value ?? !currentlyOn;
+    mask[byteIndex] = turnOn ? mask[byteIndex] | bit : mask[byteIndex] & ~bit;
+    updateState({ ledMask: mask });
+  };
+  const ledPoints = Array.from({ length: LED_COUNT }, (_, index) => {
+    const side = Math.floor(index / LEDS_PER_SIDE);
+    const t = (index % LEDS_PER_SIDE) / LEDS_PER_SIDE;
+    if (side === 0) return [20 + t * 260, 20];
+    if (side === 1) return [280, 20 + t * 260];
+    if (side === 2) return [280 - t * 260, 280];
+    return [20, 280 - t * 260];
+  });
+  const isLedOn = (index: number) => (state.ledMask[Math.floor(index / 8)] & (1 << (index % 8))) !== 0;
+  const litConnections = ledPoints.slice(0, -1).flatMap(([x1, y1], index) => {
+    if (Math.floor(index / LEDS_PER_SIDE) !== Math.floor((index + 1) / LEDS_PER_SIDE) || !isLedOn(index) || !isLedOn(index + 1)) return [];
+    const [x2, y2] = ledPoints[index + 1];
+    return [`M${x1},${y1} L${x2},${y2}`];
+  }).join(" ");
 
   return (
     <main className="shell">
       <div className="container">
         <header className="header">
           <div className="status-group">
-            <span className={`status-indicator ${connected ? "online" : "offline"}`} />
-            <p className="eyebrow">{connected ? "System Online" : "Connecting..."}</p>
+            <span className={`status-indicator ${connectionStatus}`} />
+            <p className="eyebrow" aria-live="polite">
+              {connectionStatus === "connected" ? "System Online" : connectionStatus === "reconnecting" ? "Reconnecting…" : "Connecting…"}
+            </p>
           </div>
           <h1>Ceiling LED</h1>
         </header>
 
         <section className="visualizer-section">
           <div className="led-square-wrapper">
-            <div 
-              className={`led-square ${state.power && state.pattern !== 0 ? "animating" : ""}`} 
-              style={{ 
-                borderColor: rgbToHex(...state.color),
-                boxShadow: `0 0 ${state.brightness / 4}px ${glowColor}, inset 0 0 ${state.brightness / 8}px ${glowColor}`,
-                opacity: state.power ? 1 : 0.3
-              }}
-            >
-              <div className="square-content">
-                <span className="meters">14 Meters</span>
-                <span className="strip-type">SK6812 RGBW</span>
-              </div>
+            <div className="led-square" role="group" aria-label="480 individually controlled LEDs, 120 per side" onPointerUp={() => setTraceValue(null)} onPointerLeave={() => setTraceValue(null)}>
+              <svg className="led-map" viewBox="0 0 300 300" aria-label="Click or trace individual LED pixels to toggle them">
+                {state.power && litConnections && <path className="led-connections" d={litConnections} style={{ stroke: rgbToHex(...state.color), filter: `drop-shadow(0 0 2px ${rgbToHex(...state.color)})`, opacity: Math.max(0.2, state.brightness / 255) }} />}
+                {ledPoints.map(([x, y], index) => {
+                  const on = isLedOn(index);
+                  const paintLed = (value?: boolean) => setLed(index, value);
+                  return <g key={index} role="button" tabIndex={0} aria-label={`LED ${index + 1}, ${on ? "on" : "off"}`}
+                    onPointerDown={(event) => { event.preventDefault(); const value = !on; setTraceValue(value); paintLed(value); }}
+                    onPointerEnter={() => { if (traceValue !== null) paintLed(traceValue); }}
+                    onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") paintLed(); }}>
+                    <circle cx={x} cy={y} r="2" className="led-hit" />
+                    <circle cx={x} cy={y} r="1.25" className={`digital-led ${on && state.power ? "lit" : ""}`}
+                      style={on && state.power ? { fill: rgbToHex(...state.color), opacity: Math.max(0.2, state.brightness / 255) } : undefined} />
+                  </g>;
+                })}
+                <text x="150" y="142" className="square-label">4 SIDES</text>
+                <text x="150" y="159" className="square-sub-label">120 LEDs EACH</text>
+              </svg>
             </div>
           </div>
         </section>

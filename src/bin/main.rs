@@ -7,7 +7,7 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources};
 use embassy_time::{Duration, Timer};
@@ -34,6 +34,7 @@ const WS2812_RESET_CODES: usize = 1;
 const WS2812_FRAME_CODES: usize = LED_COUNT * WS2812_BITS_PER_LED + WS2812_RESET_CODES;
 static LED_COLOR_POWER: AtomicU32 = AtomicU32::new(0x80FF_A500);
 static LED_EFFECT: AtomicU32 = AtomicU32::new((128 << 8) | 0);
+static WIFI_CONNECT_FAILED: AtomicBool = AtomicBool::new(false);
 
 // Keep the large, fixed waveform buffer out of the runtime heap used for task stacks.
 static mut LED_FRAME: [PulseCode; WS2812_FRAME_CODES] = [PulseCode(0); WS2812_FRAME_CODES];
@@ -178,6 +179,8 @@ async fn connection(mut controller: WifiController<'static>) {
             Timer::after(Duration::from_secs(1)).await;
         }
 
+        WIFI_CONNECT_FAILED.store(false, Ordering::Relaxed);
+
         let station_config = Config::Station(
             StationConfig::default()
                 .with_ssid(SSID)
@@ -195,6 +198,7 @@ async fn connection(mut controller: WifiController<'static>) {
                 SSID, info.channel
             ),
             Err(err) => {
+                WIFI_CONNECT_FAILED.store(true, Ordering::Relaxed);
                 warn!("Wi-Fi connect failed: {:?}", err);
                 Timer::after(Duration::from_secs(5)).await;
             }
@@ -285,14 +289,15 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(connection(wifi_controller).expect("failed to create Wi-Fi connection task"));
     spawner.spawn(net_task(runner).expect("failed to create network task"));
 
-    wait_for_network(stack).await;
+    status_channel = wait_for_network(stack, status_channel, &mut status_frame).await;
     spawner.spawn(http_server(stack).expect("failed to create HTTP server task"));
-    fill_status_frame(&mut status_frame, 0, 24, 0);
+    // Keep the onboard indicator off while the 600-pixel strip is running.
+    fill_status_frame(&mut status_frame, 0, 0, 0);
     status_channel
         .transmit(&status_frame)
-        .expect("failed to turn on status LED")
+        .expect("failed to turn off status LED")
         .wait()
-        .expect("status LED on transmission failed");
+        .expect("status LED off transmission failed");
 
     let mut phase = 0u8;
     loop {
@@ -311,9 +316,29 @@ async fn main(spawner: Spawner) -> ! {
     }
 }
 
-async fn wait_for_network(stack: Stack<'_>) {
+async fn wait_for_network<'stack, 'channel, 'frame>(
+    stack: Stack<'stack>,
+    mut status_channel: esp_hal::rmt::Channel<'channel, esp_hal::Blocking, esp_hal::rmt::Tx>,
+    status_frame: &'frame mut [PulseCode; 25],
+) -> esp_hal::rmt::Channel<'channel, esp_hal::Blocking, esp_hal::rmt::Tx> {
     info!("Waiting for Wi-Fi link");
+    let mut blink_on = false;
     while !stack.is_link_up() {
+        if WIFI_CONNECT_FAILED.load(Ordering::Relaxed) {
+            fill_status_frame(status_frame, 24, 0, 0);
+        } else {
+            blink_on = !blink_on;
+            if blink_on {
+                fill_status_frame(status_frame, 0, 0, 24);
+            } else {
+                fill_status_frame(status_frame, 0, 0, 0);
+            }
+        }
+        status_channel = status_channel
+            .transmit(status_frame)
+            .expect("failed to update Wi-Fi status LED")
+            .wait()
+            .expect("Wi-Fi status LED transmission failed");
         Timer::after(Duration::from_millis(500)).await;
     }
 
@@ -321,9 +346,24 @@ async fn wait_for_network(stack: Stack<'_>) {
     loop {
         if let Some(config) = stack.config_v4() {
             info!("Serving React app at http://{}/", config.address.address());
-            break;
+            return status_channel;
         }
 
+        if WIFI_CONNECT_FAILED.load(Ordering::Relaxed) {
+            fill_status_frame(status_frame, 24, 0, 0);
+        } else {
+            blink_on = !blink_on;
+            if blink_on {
+                fill_status_frame(status_frame, 0, 0, 24);
+            } else {
+                fill_status_frame(status_frame, 0, 0, 0);
+            }
+        }
+        status_channel = status_channel
+            .transmit(status_frame)
+            .expect("failed to update Wi-Fi status LED")
+            .wait()
+            .expect("Wi-Fi status LED transmission failed");
         Timer::after(Duration::from_millis(500)).await;
     }
 }

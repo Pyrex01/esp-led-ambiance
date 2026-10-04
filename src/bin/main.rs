@@ -40,6 +40,8 @@ const SETTINGS_PARTITION_START: u32 = 0x3F_E000;
 const SETTINGS_SLOT_SIZE: u32 = 0x1000;
 const SETTINGS_MAGIC: u32 = 0x4C45_4453;
 const SETTINGS_RECORD_SIZE: usize = 80;
+const OTA_CHUNK_SIZE: usize = 4096;
+static OTA_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static LED_COLOR_POWER: AtomicU32 = AtomicU32::new(0x80FF_A500);
 static LED_EFFECT: AtomicU32 = AtomicU32::new((128 << 8) | 0);
 static LED_MASK: [AtomicU32; LED_MASK_WORDS] = [const { AtomicU32::new(u32::MAX) }; LED_MASK_WORDS];
@@ -598,6 +600,10 @@ impl<State> PathRouterService<State> for EmbeddedAssets {
         R: picoserve::io::Read,
         W: ResponseWriter<Error = R::Error>,
     {
+        if request.parts.method() == "POST" && path.encoded() == "/update" {
+            return handle_firmware_update(request, response_writer).await;
+        }
+
         match request.parts.method() {
             "GET" | "HEAD" => {
                 let asset = find_asset(path.encoded()).unwrap_or_else(|| {
@@ -624,6 +630,99 @@ impl<State> PathRouterService<State> for EmbeddedAssets {
             }
         }
     }
+}
+
+async fn handle_firmware_update<R, W>(
+    mut request: Request<'_, R>,
+    response_writer: W,
+) -> Result<ResponseSent, W::Error>
+where
+    R: picoserve::io::Read,
+    W: ResponseWriter<Error = R::Error>,
+{
+    let body = request.body_connection.body();
+    let image_len = body.content_length();
+    if image_len < 24 || image_len > 0x1F_0000 {
+        return (StatusCode::BAD_REQUEST, "Invalid firmware image size")
+            .write_to(request.body_connection.finalize().await?, response_writer)
+            .await;
+    }
+    if OTA_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "An update is already running")
+            .write_to(request.body_connection.finalize().await?, response_writer)
+            .await;
+    }
+
+    // Stream and align writes to the flash driver's 4-byte write requirement.
+    let mut reader = body.reader();
+    let mut flash = FlashStorage::new();
+    let mut partition_table = [0u8; esp_bootloader_esp_idf::partitions::PARTITION_TABLE_MAX_LEN];
+    let result = async {
+        let mut updater = esp_bootloader_esp_idf::ota_updater::OtaUpdater::new(
+            &mut flash,
+            &mut partition_table,
+        )
+        .map_err(|_| ())?;
+        {
+            let (mut partition, _) = updater.next_partition().map_err(|_| ())?;
+            if image_len > partition.partition_size() {
+                return Err(());
+            }
+            let erase_len = (image_len + 0xFFF) & !0xFFF;
+            partition.erase(0, erase_len as u32).map_err(|_| ())?;
+
+            let mut buffer = [0xFFu8; OTA_CHUNK_SIZE];
+            let mut offset = 0usize;
+            let mut first = true;
+            while offset < image_len {
+                let count = (image_len - offset).min(OTA_CHUNK_SIZE);
+                let mut filled = 0;
+                while filled < count {
+                    let read = futures_read(&mut reader, &mut buffer[filled..count]).await?;
+                    if read == 0 {
+                        return Err(());
+                    }
+                    filled += read;
+                }
+                if first && buffer[0] != 0xE9 {
+                    return Err(());
+                }
+                first = false;
+                let write_len = (count + 3) & !3;
+                partition.write(offset as u32, &buffer[..write_len]).map_err(|_| ())?;
+                offset += count;
+                buffer.fill(0xFF);
+            }
+        }
+        updater.activate_next_partition().map_err(|_| ())?;
+        Ok(())
+    }
+    .await;
+
+    // Ensure the body is consumed and release the connection before sending a response.
+    let connection = request.body_connection.finalize().await?;
+    OTA_IN_PROGRESS.store(false, Ordering::Release);
+    if result.is_ok() {
+        let _response = (StatusCode::OK, "Firmware installed; restarting now.")
+            .write_to(connection, response_writer)
+            .await?;
+        Timer::after(Duration::from_millis(300)).await;
+        esp_hal::system::software_reset();
+        #[allow(unreachable_code)]
+        Ok(_response)
+    } else {
+        (StatusCode::BAD_REQUEST, "Firmware update failed")
+            .write_to(connection, response_writer)
+            .await
+    }
+}
+
+async fn futures_read<R: picoserve::io::Read>(
+    reader: &mut picoserve::request::RequestBodyReader<'_, R>,
+    buffer: &mut [u8],
+) -> Result<usize, ()> {
+    use embedded_io_async::Read as _;
+    reader.read(buffer).await.map_err(|_| ())
 }
 
 struct EncodedAsset(&'static Asset);

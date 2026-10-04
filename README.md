@@ -36,11 +36,24 @@ const SSID: &str = "Enchanter";
 const PASSWORD: &str = "Khanhome";
 ```
 
-Flash the firmware:
+For the first flash, connect USB and install the OTA-capable firmware and new
+partition table:
 
 ```sh
 cargo run --release
 ```
+
+After that, update over Wi-Fi from a computer on the same network. Use the IP
+printed by the serial monitor:
+
+```sh
+./ota-update.sh 192.168.1.42
+```
+
+This builds the firmware, saves an ESP32-S3 application image, uploads it to
+`http://<device-ip>/update`, and the ESP32 reboots into the new image. OTA
+images must fit within the 1.875 MB app slots. Keep USB available for the first
+OTA-capable flash or recovery if an update is interrupted by power loss.
 
 The serial monitor prints the assigned URL, for example:
 

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { createRoot } from "react-dom/client";
-import { Power, Sun, Palette, Wand2, Plus, Trash2, Play } from "lucide-react";
+import { Power, Sun, Palette, Wand2, Plus, Trash2 } from "lucide-react";
 import "./style.css";
 
 interface LedState {
@@ -21,7 +21,6 @@ const DEFAULT_PRESETS: [number, number, number][] = [
 ];
 
 const PATTERNS = ["Solid", "Rainbow", "Pulse", "Chase", "Strobe", "Flow"];
-const initialFrames = ["#ff6b6b", "#ffd166", "#b9f18f", "#8fd3ff"];
 
 function App() {
   const [state, setState] = useState<LedState>({
@@ -33,13 +32,7 @@ function App() {
   });
 
   const [customColors, setCustomColors] = useState<[number, number, number][]>([]);
-  const [keyframes, setKeyframes] = useState(initialFrames);
-  const [duration, setDuration] = useState(500);
   const [phase, setPhase] = useState(0);
-  const keyframesRef = useRef(keyframes);
-  const durationRef = useRef(duration);
-  keyframesRef.current = keyframes;
-  durationRef.current = duration;
   const [connectionStatus, setConnectionStatus] = useState<"connecting" | "reconnecting" | "connected">("connecting");
   const ws = useRef<WebSocket | null>(null);
   const stateRef = useRef(state);
@@ -90,7 +83,6 @@ function App() {
         setConnectionStatus("connected");
         const current = stateRef.current;
         socket.send(new Uint8Array([current.power ? 1 : 0, ...current.color, current.brightness, current.pattern, ...current.ledMask]));
-        if (current.pattern === 6) sendAnimation(socket);
       };
     socket.onclose = () => {
         if (ws.current === socket) ws.current = null;
@@ -122,14 +114,6 @@ function App() {
       socket?.close();
     };
   }, []);
-
-  const sendAnimation = (socket = ws.current) => {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    const colors = keyframesRef.current.slice(0, 8).map(hexToRgb);
-    const ms = durationRef.current;
-    const packet = new Uint8Array([0xA1, colors.length, ms & 255, ms >> 8, ...colors.flat()]);
-    socket.send(packet);
-  };
 
   useEffect(() => {
     return connect();
@@ -274,10 +258,6 @@ function App() {
     }
     if (state.pattern === 3 && (index + Math.floor(phase * 3)) % 24 >= 8) return [12, 14, 12];
     if (state.pattern === 4 && Math.floor(phase) % 16 < 8) return [12, 14, 12];
-    if (state.pattern === 6 && keyframes.length) {
-      const idx = Math.floor(phase * 30 / duration) % keyframes.length;
-      return hexToRgb(keyframes[idx]);
-    }
     return state.color;
   };
   const stripSides = [
@@ -387,14 +367,6 @@ function App() {
                   {name}
                 </button>
               ))}
-              <button className={`pattern-btn ${state.pattern === 6 ? "active" : ""}`} onClick={() => updateState({ pattern: 6, power: true })}>My animation</button>
-            </div>
-            <div className="animation-editor">
-              <div className="editor-heading"><span>Build a loop</span><button onClick={() => setKeyframes([...keyframes, "#8f8cff"].slice(0, 8))} disabled={keyframes.length >= 8}><Plus size={14}/> Add color</button></div>
-              <div className="keyframe-row">{keyframes.map((color, i) => <div className="keyframe" key={i}><input aria-label={`Animation color ${i + 1}`} type="color" value={color} onChange={(e) => setKeyframes(keyframes.map((item, index) => index === i ? e.target.value : item))}/>{keyframes.length > 2 && <button aria-label="Remove color" onClick={() => setKeyframes(keyframes.filter((_, index) => index !== i))}><Trash2 size={12}/></button>}</div>)}</div>
-              <label className="duration-label">Transition time <span>{(duration / 1000).toFixed(1)} sec</span></label>
-              <input type="range" min="200" max="3000" step="100" value={duration} onChange={(e) => setDuration(Number(e.target.value))}/>
-              <button className="apply-animation" onClick={() => { updateState({ pattern: 6, power: true }); sendAnimation(); }}><Play size={14} fill="currentColor"/> Play on LEDs</button>
             </div>
           </div>
         </section>

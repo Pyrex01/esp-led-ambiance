@@ -235,7 +235,7 @@ async fn http_server(stack: Stack<'static>) {
 
     loop {
         picoserve::Server::new(&app, &config, &mut [0; 1024])
-            .listen_and_serve("web", stack, 80, &mut [0; 4096], &mut [0; 4096])
+            .listen_and_serve("web", stack, 80, &mut [0; 2048], &mut [0; 2048])
             .await;
     }
 }
@@ -296,7 +296,7 @@ async fn main(spawner: Spawner) -> ! {
     let (stack, runner) = embassy_net::new(
         interfaces.station,
         net_config,
-        mk_static!(StackResources<4>, StackResources::<4>::new()),
+        mk_static!(StackResources<8>, StackResources::<8>::new()),
         net_seed,
     );
 
@@ -304,6 +304,10 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(net_task(runner).expect("failed to create network task"));
 
     status_channel = wait_for_network(stack, status_channel, &mut status_frame).await;
+    spawner.spawn(http_server(stack).expect("failed to create HTTP server task"));
+    // Each picoserve task handles one connection at a time. Run three listeners
+    // so multiple browsers and their WebSockets can stay connected concurrently.
+    spawner.spawn(http_server(stack).expect("failed to create HTTP server task"));
     spawner.spawn(http_server(stack).expect("failed to create HTTP server task"));
     // Keep the onboard indicator off while the 480-pixel strip is running.
     fill_status_frame(&mut status_frame, 0, 0, 0);

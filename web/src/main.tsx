@@ -81,8 +81,19 @@ function App() {
         retryDelay = 1000;
         ws.current = socket;
         setConnectionStatus("connected");
-        const current = stateRef.current;
-        socket.send(new Uint8Array([current.power ? 1 : 0, ...current.color, current.brightness, current.pattern, ...current.ledMask]));
+      };
+      socket.onmessage = (event) => {
+        if (!(event.data instanceof ArrayBuffer) || event.data.byteLength !== 6 + LED_MASK_BYTES) return;
+        const bytes = new Uint8Array(event.data);
+        const restored: LedState = {
+          power: bytes[0] !== 0,
+          color: [bytes[1], bytes[2], bytes[3]],
+          brightness: bytes[4],
+          pattern: bytes[5],
+          ledMask: Array.from(bytes.slice(6)),
+        };
+        stateRef.current = restored;
+        setState(restored);
       };
     socket.onclose = () => {
         if (ws.current === socket) ws.current = null;

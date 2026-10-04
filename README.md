@@ -48,5 +48,10 @@ The serial monitor prints the assigned URL, for example:
 Serving React app at http://192.168.1.42/
 ```
 
+The firmware saves the LED power, color, effect, and per-LED mask to the
+`led_state` flash partition after changes settle, then restores them at boot.
+`espflash.toml` selects the custom 4 MB partition table in `partitions.bin`;
+keep that table and `partitions.csv` together when flashing the firmware.
+
 Browsers request Brotli by default, and the ESP replies with
 `Content-Encoding: br`.

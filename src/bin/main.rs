@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources};
 use embassy_time::{Duration, Timer};
+use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::rmt::{PulseCode, Rmt, TxChannelConfig, TxChannelCreator};
@@ -18,6 +19,7 @@ use esp_hal::rng::Rng;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::wifi::{Config, Interface, WifiController, sta::StationConfig};
+use esp_storage::FlashStorage;
 use log::{error, info, warn};
 use picoserve::ResponseSent;
 use picoserve::request::{Path, Request};
@@ -34,6 +36,10 @@ const LED_MASK_WORDS: usize = LED_COUNT / 32;
 const WS2812_BITS_PER_LED: usize = 24;
 const WS2812_RESET_CODES: usize = 1;
 const WS2812_FRAME_CODES: usize = LED_COUNT * WS2812_BITS_PER_LED + WS2812_RESET_CODES;
+const SETTINGS_PARTITION_START: u32 = 0x3F_E000;
+const SETTINGS_SLOT_SIZE: u32 = 0x1000;
+const SETTINGS_MAGIC: u32 = 0x4C45_4453;
+const SETTINGS_RECORD_SIZE: usize = 80;
 static LED_COLOR_POWER: AtomicU32 = AtomicU32::new(0x80FF_A500);
 static LED_EFFECT: AtomicU32 = AtomicU32::new((128 << 8) | 0);
 static LED_MASK: [AtomicU32; LED_MASK_WORDS] = [const { AtomicU32::new(u32::MAX) }; LED_MASK_WORDS];
@@ -41,6 +47,142 @@ static WIFI_CONNECT_FAILED: AtomicBool = AtomicBool::new(false);
 
 // Keep the large, fixed waveform buffer out of the runtime heap used for task stacks.
 static mut LED_FRAME: [PulseCode; WS2812_FRAME_CODES] = [PulseCode(0); WS2812_FRAME_CODES];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LedState {
+    color_power: u32,
+    effect: u32,
+    mask: [u32; LED_MASK_WORDS],
+}
+
+struct StateStore {
+    flash: FlashStorage,
+    active_slot: Option<u8>,
+    sequence: u32,
+}
+
+impl LedState {
+    fn current() -> Self {
+        Self {
+            color_power: LED_COLOR_POWER.load(Ordering::Relaxed),
+            effect: LED_EFFECT.load(Ordering::Relaxed),
+            mask: core::array::from_fn(|index| LED_MASK[index].load(Ordering::Relaxed)),
+        }
+    }
+
+    fn to_packet(self) -> [u8; 6 + LED_COUNT / 8] {
+        let color_power = self.color_power;
+        let effect = self.effect;
+        let mut packet = [0u8; 6 + LED_COUNT / 8];
+        packet[0] = (color_power >> 31) as u8;
+        packet[1] = (color_power >> 16) as u8;
+        packet[2] = (color_power >> 8) as u8;
+        packet[3] = color_power as u8;
+        packet[4] = (effect >> 8) as u8;
+        packet[5] = effect as u8;
+        for (index, byte) in packet[6..].iter_mut().enumerate() {
+            let word = self.mask[index / 4].to_le_bytes();
+            *byte = word[index % 4];
+        }
+        packet
+    }
+
+    fn restore(self) {
+        LED_COLOR_POWER.store(self.color_power, Ordering::Relaxed);
+        LED_EFFECT.store(self.effect, Ordering::Relaxed);
+        for (word, value) in self.mask.into_iter().enumerate() {
+            LED_MASK[word].store(value, Ordering::Relaxed);
+        }
+    }
+
+    fn encode(self, sequence: u32) -> [u8; SETTINGS_RECORD_SIZE] {
+        let mut bytes = [0u8; SETTINGS_RECORD_SIZE];
+        bytes[0..4].copy_from_slice(&SETTINGS_MAGIC.to_le_bytes());
+        bytes[4..8].copy_from_slice(&sequence.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.color_power.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.effect.to_le_bytes());
+        for (index, word) in self.mask.iter().enumerate() {
+            let offset = 16 + index * 4;
+            bytes[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let checksum = crc32(&bytes[..76]);
+        bytes[76..80].copy_from_slice(&checksum.to_le_bytes());
+        bytes
+    }
+
+    fn decode(bytes: &[u8; SETTINGS_RECORD_SIZE]) -> Option<(Self, u32)> {
+        if u32::from_le_bytes(bytes[0..4].try_into().ok()?) != SETTINGS_MAGIC
+            || u32::from_le_bytes(bytes[76..80].try_into().ok()?) != crc32(&bytes[..76])
+        {
+            return None;
+        }
+        let mut mask = [0; LED_MASK_WORDS];
+        for (index, word) in mask.iter_mut().enumerate() {
+            let offset = 16 + index * 4;
+            *word = u32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?);
+        }
+        Some((
+            Self {
+                color_power: u32::from_le_bytes(bytes[8..12].try_into().ok()?),
+                effect: u32::from_le_bytes(bytes[12..16].try_into().ok()?),
+                mask,
+            },
+            u32::from_le_bytes(bytes[4..8].try_into().ok()?),
+        ))
+    }
+}
+
+impl StateStore {
+    fn load() -> (Self, Option<LedState>) {
+        let mut store = Self {
+            flash: FlashStorage::new(),
+            active_slot: None,
+            sequence: 0,
+        };
+        let mut best: Option<(LedState, u32, u8)> = None;
+        for slot in 0..2 {
+            let mut bytes = [0u8; SETTINGS_RECORD_SIZE];
+            let offset = SETTINGS_PARTITION_START + slot as u32 * SETTINGS_SLOT_SIZE;
+            if store.flash.read(offset, &mut bytes).is_ok() {
+                if let Some((state, sequence)) = LedState::decode(&bytes) {
+                    if best.as_ref().is_none_or(|(_, latest, _)| {
+                        sequence.wrapping_sub(*latest) < 0x8000_0000 && sequence != *latest
+                    }) {
+                        best = Some((state, sequence, slot));
+                    }
+                }
+            }
+        }
+        let state = best.map(|(state, sequence, slot)| {
+            store.sequence = sequence;
+            store.active_slot = Some(slot);
+            state
+        });
+        (store, state)
+    }
+
+    fn save(&mut self, state: LedState) -> Result<(), esp_storage::FlashStorageError> {
+        let next_slot = self.active_slot.map_or(0, |slot| 1 - slot);
+        let start = SETTINGS_PARTITION_START + next_slot as u32 * SETTINGS_SLOT_SIZE;
+        self.flash.erase(start, start + SETTINGS_SLOT_SIZE)?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let record = state.encode(self.sequence);
+        self.flash.write(start, &record)?;
+        self.active_slot = Some(next_slot);
+        Ok(())
+    }
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
+}
 
 /// Encode a WS2812 bit using a 40 MHz RMT clock (25 ns per tick).
 fn ws2812_bit(bit: bool) -> PulseCode {
@@ -124,12 +266,13 @@ impl picoserve::response::ws::WebSocketCallback for LedWebSocket {
     async fn run<R, W>(
         self,
         mut rx: picoserve::response::ws::SocketRx<R>,
-        _tx: picoserve::response::ws::SocketTx<W>,
+        mut tx: picoserve::response::ws::SocketTx<W>,
     ) -> Result<(), W::Error>
     where
         R: picoserve::io::Read,
         W: picoserve::io::Write<Error = R::Error>,
     {
+        tx.send_binary(&LedState::current().to_packet()).await?;
         let mut message = [0u8; 66];
         loop {
             match rx
@@ -152,7 +295,10 @@ impl picoserve::response::ws::WebSocketCallback for LedWebSocket {
                     for word in 0..LED_MASK_WORDS {
                         let offset = 6 + word * 4;
                         let bits = u32::from_le_bytes([
-                            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                            data[offset],
+                            data[offset + 1],
+                            data[offset + 2],
+                            data[offset + 3],
                         ]);
                         LED_MASK[word].store(bits, Ordering::Relaxed);
                     }
@@ -222,7 +368,7 @@ async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
     runner.run().await
 }
 
-#[embassy_executor::task]
+#[embassy_executor::task(pool_size = 3)]
 async fn http_server(stack: Stack<'static>) {
     let app = picoserve::Router::from_service(EmbeddedAssets)
         .route("/ws", picoserve::routing::get(websocket_endpoint));
@@ -251,6 +397,14 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
     esp_alloc::heap_allocator!(size: 98_767);
+
+    let (mut state_store, restored_state) = StateStore::load();
+    if let Some(state) = restored_state {
+        state.restore();
+        info!("Restored LED settings from flash");
+    } else {
+        info!("No saved LED settings found; using defaults");
+    }
 
     // GPIO 5 follows the power state selected in the web UI.
     let mut power_output = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
@@ -318,6 +472,9 @@ async fn main(spawner: Spawner) -> ! {
         .expect("status LED off transmission failed");
 
     let mut phase = 0u8;
+    let mut observed_state = LedState::current();
+    let mut persisted_state = restored_state.unwrap_or(observed_state);
+    let mut unsaved_for_ms = 0u32;
     loop {
         if LED_COLOR_POWER.load(Ordering::Relaxed) & 0x8000_0000 != 0 {
             power_output.set_high();
@@ -335,6 +492,26 @@ async fn main(spawner: Spawner) -> ! {
             .expect("failed to start WS2812 frame");
         led_channel = transaction.wait().expect("WS2812 transmission failed");
         phase = phase.wrapping_add(1);
+        let current_state = LedState::current();
+        if current_state != observed_state {
+            observed_state = current_state;
+            unsaved_for_ms = 0;
+        }
+        if current_state != persisted_state {
+            unsaved_for_ms = unsaved_for_ms.saturating_add(30);
+            if unsaved_for_ms >= 500 {
+                match state_store.save(current_state) {
+                    Ok(()) => {
+                        persisted_state = current_state;
+                        info!("Saved LED settings to flash");
+                    }
+                    Err(err) => warn!("Could not save LED settings: {:?}", err),
+                }
+                unsaved_for_ms = 0;
+            }
+        } else {
+            unsaved_for_ms = 0;
+        }
         Timer::after(Duration::from_millis(30)).await;
     }
 }

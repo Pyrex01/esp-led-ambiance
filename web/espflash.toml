@@ -1,0 +1,6 @@
+# cargo run is often invoked from web/ after starting the Tauri app.
+[flash]
+size = "4MB"
+
+[idf]
+partition_table = "../partitions.bin"

@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { createRoot } from "react-dom/client";
-import { Power, Sun, Palette, Wand2, Plus, Trash2, ScanLine } from "lucide-react";
+import { Power, Sun, Palette, Wand2, Plus, Trash2, ScanLine, Monitor, Square } from "lucide-react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./style.css";
 
 interface LedState {
@@ -33,6 +35,12 @@ const DEFAULT_PRESETS: [number, number, number][] = [
 ];
 
 const PATTERNS = ["Solid", "Rainbow", "Pulse", "Chase", "Strobe", "Flow"];
+type Rgb = [number, number, number];
+
+interface DesktopMonitor { id: number; name: string; width: number; height: number; primary: boolean }
+
+const isAmbientDesktop = isTauri() && /(Linux|Windows)/i.test(navigator.userAgent);
+const isDesktopApp = isTauri();
 
 function App() {
   const [state, setState] = useState<LedState>({
@@ -46,9 +54,89 @@ function App() {
   const [customColors, setCustomColors] = useState<[number, number, number][]>([]);
   const [phase, setPhase] = useState(0);
   const [connectionStatus, setConnectionStatus] = useState<"connecting" | "reconnecting" | "connected">("connecting");
+  const [deviceHost, setDeviceHost] = useState(() => localStorage.getItem("deviceHost") || "192.168.4.1");
+  const deviceHostRef = useRef(deviceHost);
   const ws = useRef<WebSocket | null>(null);
   const stateRef = useRef(state);
   const previousMaskRef = useRef<number[] | null>(null);
+  const [ambientActive, setAmbientActive] = useState(false);
+  const [captureStatus, setCaptureStatus] = useState("Choose a display to start capture");
+  const [ambientColors, setAmbientColors] = useState<Rgb[]>([[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]]);
+  const [monitors, setMonitors] = useState<DesktopMonitor[]>([]);
+  const [selectedMonitor, setSelectedMonitor] = useState<number | null>(null);
+  const ambientActiveRef = useRef(false);
+
+  const stopAmbient = useCallback((sendOff = true) => {
+    if (isAmbientDesktop) void invoke("stop_capture");
+    if (sendOff && ws.current?.readyState === WebSocket.OPEN) {
+      ws.current.send(new Uint8Array([0xB1, 0, stateRef.current.brightness, ...Array(12).fill(0)]));
+    }
+    ambientActiveRef.current = false;
+    setAmbientActive(false);
+    setCaptureStatus("Capture stopped");
+  }, []);
+
+  const startAmbient = async () => {
+    if (!isAmbientDesktop) {
+      setCaptureStatus("Ambient capture is available in the Linux or Windows desktop app only");
+      return;
+    }
+    if (selectedMonitor === null) {
+      setCaptureStatus("Select a display first");
+      return;
+    }
+    try {
+      await invoke("start_capture", { monitorId: selectedMonitor });
+      ambientActiveRef.current = true;
+      setAmbientActive(true);
+      setCaptureStatus("Capturing display on this desktop");
+    } catch (error) {
+      setCaptureStatus(error instanceof Error ? error.message : "Could not start display capture");
+    }
+  };
+  const saveDeviceHost = () => {
+    const host = deviceHost.trim().replace(/^(https?|wss?):\/\//i, "").replace(/\/+$/, "");
+    if (!host) return;
+    localStorage.setItem("deviceHost", host);
+    deviceHostRef.current = host;
+    setDeviceHost(host);
+    ws.current?.close();
+  };
+
+  useEffect(() => {
+    if (!isAmbientDesktop) return;
+    let disposed = false;
+    let unlistenColors: (() => void) | undefined;
+    let unlistenError: (() => void) | undefined;
+    void invoke<DesktopMonitor[]>("list_monitors").then((available) => {
+      if (disposed) return;
+      setMonitors(available);
+      const primary = available.find((monitor) => monitor.primary) ?? available[0];
+      if (primary) setSelectedMonitor(primary.id);
+    }).catch((error) => { if (!disposed) setCaptureStatus(String(error)); });
+    void listen<Rgb[]>("ambient-colors", (event) => {
+      const colors = event.payload;
+      setAmbientColors(colors);
+      const socket = ws.current;
+      if (ambientActiveRef.current && socket?.readyState === WebSocket.OPEN && socket.bufferedAmount < 256) {
+        socket.send(new Uint8Array([0xB1, 1, stateRef.current.brightness, ...colors.flat()]));
+      }
+    }).then((unlisten) => { if (disposed) unlisten(); else unlistenColors = unlisten; });
+    void listen<string>("ambient-capture-error", (event) => {
+      setCaptureStatus(event.payload);
+      setAmbientActive(false);
+      ambientActiveRef.current = false;
+      if (ws.current?.readyState === WebSocket.OPEN) {
+        ws.current.send(new Uint8Array([0xB1, 0, stateRef.current.brightness, ...Array(12).fill(0)]));
+      }
+    }).then((unlisten) => { if (disposed) unlisten(); else unlistenError = unlisten; });
+    return () => {
+      disposed = true;
+      void invoke("stop_capture");
+      unlistenColors?.();
+      unlistenError?.();
+    };
+  }, []);
 
   useEffect(() => {
     const saved = localStorage.getItem("customColors");
@@ -68,8 +156,6 @@ function App() {
   };
 
   const connect = useCallback(() => {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${protocol}//${window.location.host}/ws`;
     let stopped = false;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let retryDelay = 1000;
@@ -79,6 +165,8 @@ function App() {
       setConnectionStatus((status) => status === "connected" ? "reconnecting" : status);
       let socket: WebSocket;
       try {
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const url = isDesktopApp ? `ws://${deviceHostRef.current}/ws` : `${protocol}//${window.location.host}/ws`;
         socket = new WebSocket(url);
       } catch {
         scheduleRetry();
@@ -159,6 +247,7 @@ function App() {
   }, []);
 
   const updateState = (updates: Partial<LedState>) => {
+    if (ambientActiveRef.current) stopAmbient(false);
     const newState = { ...stateRef.current, ...updates };
     stateRef.current = newState;
     setState(newState);
@@ -354,6 +443,33 @@ function App() {
           </button>
           <span className="shortcut-hint">4 corner L shapes · {CORNER_ARM_LENGTH} LEDs per arm</span>
         </div>
+
+        <section className="ambient-card" aria-label="Ambient lighting controls">
+          <div className="ambient-heading">
+            <div>
+              <p className="eyebrow">Desktop capture</p>
+              <h2>Ambient lighting</h2>
+            </div>
+            {isAmbientDesktop && <select className="monitor-select" value={selectedMonitor ?? ""} onChange={(event) => setSelectedMonitor(Number(event.target.value))} disabled={ambientActive || monitors.length === 0} aria-label="Display to capture">
+              {monitors.length === 0 ? <option value="">No displays found</option> : monitors.map((monitor) => <option key={monitor.id} value={monitor.id}>{monitor.name} ({monitor.width} × {monitor.height}){monitor.primary ? " · Primary" : ""}</option>)}
+            </select>}
+            <button className={`ambient-toggle ${ambientActive ? "active" : ""}`} disabled={!isAmbientDesktop || (!ambientActive && selectedMonitor === null)} onClick={ambientActive ? () => stopAmbient() : startAmbient}>
+              {ambientActive ? <Square size={16} /> : <Monitor size={16} />}
+              {ambientActive ? "Stop capture" : "Start ambient"}
+            </button>
+          </div>
+          <p className="capture-status" aria-live="polite">{isAmbientDesktop ? captureStatus : "Ambient capture is available in the Linux or Windows desktop app only."}</p>
+          <div className="ambient-preview">
+            {ambientColors.map((color, index) => <div key={index} className="ambient-side" style={{ backgroundColor: rgbToHex(...color) }}><span>{["Top", "Right", "Bottom", "Left"][index]}</span></div>)}
+          </div>
+          <p className="capture-note">The desktop app captures the selected display in native Rust and sends only four sampled colors to the ESP32. Ambient controls are disabled in browsers, mobile devices, and unsupported desktop builds.</p>
+        </section>
+
+        {isDesktopApp && <section className="device-card" aria-label="ESP32 connection">
+          <label htmlFor="device-host">ESP32 address</label>
+          <input id="device-host" value={deviceHost} onChange={(event) => setDeviceHost(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") saveDeviceHost(); }} placeholder="192.168.1.42" />
+          <button onClick={saveDeviceHost}>Connect</button>
+        </section>}
 
         <section className="controls-grid">
           <div className="control-card power-card">

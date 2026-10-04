@@ -44,6 +44,8 @@ const OTA_CHUNK_SIZE: usize = 4096;
 static OTA_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static LED_COLOR_POWER: AtomicU32 = AtomicU32::new(0x80FF_A500);
 static LED_EFFECT: AtomicU32 = AtomicU32::new((128 << 8) | 0);
+static AMBIENT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static AMBIENT_COLORS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 static LED_MASK: [AtomicU32; LED_MASK_WORDS] = [const { AtomicU32::new(u32::MAX) }; LED_MASK_WORDS];
 static WIFI_CONNECT_FAILED: AtomicBool = AtomicBool::new(false);
 
@@ -226,17 +228,30 @@ fn fill_led_frame(frame: &mut [PulseCode], phase: u8, color_power: u32, effect: 
     let blue = (color_power & 0xff) as u8;
     let brightness = ((effect >> 8) & 0xff) as u8;
     let pattern = (effect & 0xff) as u8;
+    let ambient = AMBIENT_ACTIVE.load(Ordering::Relaxed);
 
     for led in 0..LED_COUNT {
-        let (mut r, mut g, mut b) = match pattern {
-            1 => wheel(((led * 256 / LED_COUNT) as u8).wrapping_add(phase)),
-            3 if (led + phase as usize * 3) % 24 >= 8 => (0, 0, 0),
-            4 if phase % 16 < 8 => (0, 0, 0),
-            5 => wheel(((led * 256 / LED_COUNT) as u8).wrapping_add(phase.wrapping_mul(2))),
-            _ => (red, green, blue),
+        let (mut r, mut g, mut b) = if ambient {
+            let side = led / LEDS_PER_SIDE;
+            let color = AMBIENT_COLORS[side].load(Ordering::Relaxed);
+            (
+                ((color >> 16) & 0xff) as u8,
+                ((color >> 8) & 0xff) as u8,
+                (color & 0xff) as u8,
+            )
+        } else {
+            match pattern {
+                1 => wheel(((led * 256 / LED_COUNT) as u8).wrapping_add(phase)),
+                3 if (led + phase as usize * 3) % 24 >= 8 => (0, 0, 0),
+                4 if phase % 16 < 8 => (0, 0, 0),
+                5 => wheel(((led * 256 / LED_COUNT) as u8).wrapping_add(phase.wrapping_mul(2))),
+                _ => (red, green, blue),
+            }
         };
 
-        let pulse_brightness = if pattern == 2 {
+        let pulse_brightness = if ambient {
+            brightness
+        } else if pattern == 2 {
             let triangle = if phase < 128 { phase } else { 255 - phase };
             (triangle as u16 * 2) as u8
         } else {
@@ -283,7 +298,22 @@ impl picoserve::response::ws::WebSocketCallback for LedWebSocket {
             {
                 picoserve::futures::Either::First(Ok(
                     picoserve::response::ws::Message::Binary(data),
+                )) if data.len() == 14 && data[0] == 0xB1 => {
+                    AMBIENT_ACTIVE.store(true, Ordering::Relaxed);
+                    LED_COLOR_POWER.store(((data[1] & 1 != 0) as u32) << 31, Ordering::Relaxed);
+                    LED_EFFECT.store((data[2] as u32) << 8, Ordering::Relaxed);
+                    for side in 0..4 {
+                        let offset = 3 + side * 3;
+                        AMBIENT_COLORS[side].store(
+                            ((data[offset] as u32) << 16) | ((data[offset + 1] as u32) << 8) | data[offset + 2] as u32,
+                            Ordering::Relaxed,
+                        );
+                    }
+                }
+                picoserve::futures::Either::First(Ok(
+                    picoserve::response::ws::Message::Binary(data),
                 )) if data.len() == 6 + LED_COUNT / 8 => {
+                    AMBIENT_ACTIVE.store(false, Ordering::Relaxed);
                     let powered = data[0] != 0;
                     let color_power = ((powered as u32) << 31)
                         | ((data[1] as u32) << 16)
@@ -305,11 +335,21 @@ impl picoserve::response::ws::WebSocketCallback for LedWebSocket {
                         LED_MASK[word].store(bits, Ordering::Relaxed);
                     }
                 }
-                picoserve::futures::Either::First(Ok(picoserve::response::ws::Message::Close(
-                    _,
-                ))) => return Ok(()),
-                picoserve::futures::Either::First(Ok(_))
-                | picoserve::futures::Either::First(Err(_)) => {}
+                picoserve::futures::Either::First(Ok(picoserve::response::ws::Message::Close(_))) => {
+                    if AMBIENT_ACTIVE.load(Ordering::Relaxed) {
+                        AMBIENT_ACTIVE.store(false, Ordering::Relaxed);
+                        LED_COLOR_POWER.store(0, Ordering::Relaxed);
+                    }
+                    return Ok(());
+                }
+                picoserve::futures::Either::First(Ok(_)) => {}
+                picoserve::futures::Either::First(Err(_)) => {
+                    if AMBIENT_ACTIVE.load(Ordering::Relaxed) {
+                        AMBIENT_ACTIVE.store(false, Ordering::Relaxed);
+                        LED_COLOR_POWER.store(0, Ordering::Relaxed);
+                    }
+                    return Ok(());
+                }
                 picoserve::futures::Either::Second(()) => continue,
             }
         }

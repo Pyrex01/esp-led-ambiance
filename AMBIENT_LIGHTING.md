@@ -2,11 +2,11 @@
 
 ## Goal
 
-Make the LEDs around the display react to the colors in Windows or Linux games
-and videos. A desktop companion captures and samples the display, blends the
-samples into colors for the LED layout, and sends those colors to the ESP32-S3
-over Wi-Fi. The ESP32 continues to generate the WS2812 signal and drive the
-LEDs.
+Make the LEDs around the display react to colors on a desktop PC. A Tauri
+companion captures and samples the selected display, blends the samples into
+colors for the LED layout, and sends those colors to the ESP32-S3 over Wi-Fi.
+The app is developed and first exercised on Linux, with Windows as the intended
+use target. Ambient capture is disabled in browsers and on mobile devices.
 
 The ESP32 should not receive screenshots or process image data. Keeping capture
 and color analysis on the PC minimizes ESP32 RAM use, network traffic, and
@@ -14,10 +14,10 @@ firmware work.
 
 ## Components
 
-- **Desktop companion:** Provides setup and controls, captures the display,
-  computes ambient colors, and streams updates over WebSocket. It should support
-  Windows and Linux; capture APIs and permissions may differ by operating
-  system.
+- **Desktop companion:** A Tauri app uses native Rust to list monitors,
+  capture a selected display, compute ambient colors, and stream updates over
+  WebSocket. Linux X11 is the initial development target; Windows is supported
+  for use on desktop PCs.
 - **ESP32 firmware:** Connects to Wi-Fi, accepts WebSocket commands, stores only
   the current lighting state, and refreshes the LEDs. It does not need to host
   the control UI or embedded web assets.
@@ -36,17 +36,16 @@ firmware work.
 4. The ESP32 applies each side's color to its 120 LEDs and emits the normal
    WS2812 frame. It can smooth between incoming updates to reduce abrupt
    changes.
-5. If updates stop or the connection closes, firmware behavior should be
-   defined (for example, fade to off or hold the last colors). The desktop app
-   indicates connection and capture status.
+5. If updates stop or the connection closes, firmware turns the LEDs off. The
+   desktop app indicates connection and capture status.
 
-## Proposed WebSocket protocol
+## WebSocket protocol
 
-The current firmware has `/ws` and accepts a 486-byte control packet (power,
+The current firmware has `/ws` and accepts a 66-byte control packet (power,
 RGB, brightness, effect, and a 480-LED mask), plus a custom animation packet.
-Ambient mode needs a distinct packet so the smaller message is unambiguous.
+Ambient mode uses a distinct packet so the smaller message is unambiguous.
 
-Proposed v1 binary packet, 14 bytes:
+The v1 binary packet is 14 bytes:
 
 | Offset | Size | Meaning |
 | --- | ---: | --- |
@@ -60,18 +59,22 @@ The PC sends only the latest ambient state at a modest rate (initial target:
 samples instead of queueing old colors. At 30 updates/second, the payload is
 420 bytes/second before WebSocket/TCP overhead.
 
-This packet is a proposal, not implemented behavior. The firmware and desktop
-app must adopt the same version and byte order. The existing 486-byte manual
-control message can remain available for individual LED selection and setup;
-ambient mode should take precedence while active.
+This packet is implemented by the current firmware and desktop UI. The existing
+66-byte manual control message remains available for individual LED selection
+and setup; a manual update exits ambient mode. When an ambient WebSocket closes,
+firmware turns the strip off. The desktop UI sends an ambient packet with power
+disabled when capture is stopped.
 
 ## Desktop framework direction
 
-Tauri is a reasonable first choice because the existing React interface can be
-reused, while native Rust code can handle capture and processing. Screen capture
-support must be validated separately on Windows and the target Linux desktop
-environment. Flutter is also viable but would require rebuilding the current
-React UI. Framework choice does not change the WebSocket protocol.
+The React UI runs inside a Tauri desktop app. Native Rust code enumerates
+monitors, captures the selected display, downsamples samples along each edge,
+and blends successive colors before emitting only four RGB values to the UI.
+The UI sends the compact ambient packet directly to the configured ESP32
+WebSocket endpoint. Ambient capture controls are enabled in Linux and Windows
+Tauri desktop builds, and disabled in browsers and mobile apps. Linux X11 is
+the first development target; Wayland capture needs validation against the
+compositor and capture backend.
 
 ## Performance and memory constraints
 
@@ -84,20 +87,20 @@ React UI. Framework choice does not change the WebSocket protocol.
 
 ## Implementation outline
 
-1. Add the ambient packet handler and four side-color state to firmware.
-2. Render the four side colors across the existing LED ranges, retaining the
-   existing manual controls as a separate mode.
-3. Create the Windows/Linux desktop companion with device connection, display
-   selection, ambient enable/disable, and capture status.
-4. Implement OS-specific screen capture and PC-side edge sampling/blending.
-5. Add reconnect handling and a defined stale-connection behavior.
-6. Remove embedded UI asset serving once the companion can perform all required
-   setup and control tasks; keep the ESP32 WebSocket endpoint.
+1. Implement the ambient packet, side-color rendering, Tauri capture for Linux
+   and Windows, edge sampling/blending, and stale-connection off behavior.
+   (Initial increment.)
+2. Validate capture on this Linux X11 development desktop and a Windows desktop;
+   then assess Linux Wayland support.
+3. Add reconnect handling that resumes ambient updates after a device link
+   interruption.
+4. Remove embedded UI asset serving when the desktop companion can perform all
+   required setup and control tasks.
 
 ## Acceptance criteria
 
-- A Windows or Linux desktop session can select a display and enable ambient
-  lighting.
+- A Linux or Windows desktop session can select a display and enable ambient
+  lighting; browsers and mobile devices disable ambient controls.
 - The four LED sides respond to corresponding screen-edge colors and transition
   smoothly during typical gameplay/video playback.
 - No screenshot or full image is sent to the ESP32; ambient updates use the

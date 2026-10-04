@@ -125,6 +125,31 @@ h1 {
   font-size: 0.75rem;
 }
 
+.ambient-card {
+  margin: 0 0 20px;
+  padding: 20px;
+  border: 1px solid rgba(185, 241, 143, 0.18);
+  border-radius: 16px;
+  background: rgba(185, 241, 143, 0.045);
+}
+
+.ambient-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.ambient-heading h2 { margin: 4px 0 0; font-size: 1.1rem; }
+.ambient-toggle { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 11px 15px; border: 1px solid rgba(185, 241, 143, .45); border-radius: 10px; background: rgba(185, 241, 143, .12); color: #d8f5c5; font: inherit; font-weight: 650; cursor: pointer; }
+.ambient-toggle.active { color: #fff; border-color: rgba(255,255,255,.3); background: rgba(255,255,255,.09); }
+.ambient-toggle:disabled { opacity: .38; cursor: not-allowed; }
+.monitor-select { max-width: 48%; padding: 10px; border: 1px solid rgba(255,255,255,.14); border-radius: 9px; background: #171a16; color: #f7f7f2; font: inherit; font-size: .82rem; }
+.capture-status { min-height: 1.2em; margin: 12px 0; color: rgba(247,247,242,.62); font-size: .82rem; }
+.ambient-preview { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.ambient-side { display: flex; align-items: end; min-height: 52px; padding: 8px; border-radius: 8px; background: #141414; transition: background-color .12s linear; }
+.ambient-side span { padding: 3px 6px; border-radius: 5px; background: rgba(0,0,0,.48); font-size: .7rem; font-weight: 650; }
+.capture-note { margin: 12px 0 0; color: rgba(247,247,242,.42); font-size: .75rem; line-height: 1.5; }
+.capture-note code { color: rgba(247,247,242,.65); }
+.device-card { display: flex; align-items: center; gap: 10px; margin: 0 0 20px; padding: 14px 18px; border: 1px solid rgba(255,255,255,.08); border-radius: 12px; background: rgba(255,255,255,.035); }
+.device-card label { color: rgba(247,247,242,.6); font-size: .8rem; white-space: nowrap; }
+.device-card input { min-width: 0; flex: 1; padding: 9px 10px; border: 1px solid rgba(255,255,255,.12); border-radius: 8px; background: #10120f; color: white; font: inherit; }
+.device-card button { padding: 9px 13px; border: 1px solid rgba(185,241,143,.3); border-radius: 8px; background: rgba(185,241,143,.1); color: #d8f5c5; font: inherit; font-size: .82rem; cursor: pointer; }
+
 .led-square-wrapper {
   padding: 20px;
 }
@@ -359,6 +384,11 @@ input[type="range"]::-webkit-slider-thumb {
 @media (max-width: 600px) {
   .container { padding: 16px; }
   .shortcut-row { flex-direction: column; gap: 8px; margin-top: -32px; }
+  .ambient-heading { align-items: flex-start; flex-direction: column; }
+  .ambient-toggle { width: 100%; }
+  .monitor-select { max-width: none; width: 100%; }
+  .device-card { flex-wrap: wrap; }
+  .device-card label { width: 100%; }
   .controls-grid {
     grid-template-columns: 1fr;
     gap: 12px;

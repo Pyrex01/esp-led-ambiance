@@ -213,7 +213,13 @@ h1 {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 16px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
 }
+
+.controls-grid:disabled { opacity: .55; }
 
 .control-card {
   background: rgba(255, 255, 255, 0.05);

@@ -142,8 +142,10 @@ fn capture_loop(app: tauri::AppHandle, monitor_id: u32, stopped: Arc<AtomicBool>
             Ok(sampled) => {
                 for side in 0..4 {
                     for channel in 0..3 {
+                        // Heavier temporal smoothing keeps rapid screen changes
+                        // from making the physical strip flicker or snap.
                         previous[side][channel] =
-                            ((previous[side][channel] as u16 * 55 + sampled[side][channel] as u16 * 45) / 100) as u8;
+                            ((previous[side][channel] as u16 * 85 + sampled[side][channel] as u16 * 15) / 100) as u8;
                     }
                 }
                 if app.emit("ambient-colors", previous).is_err() {

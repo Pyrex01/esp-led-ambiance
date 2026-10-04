@@ -257,7 +257,11 @@ fn fill_led_frame(frame: &mut [PulseCode], phase: u8, color_power: u32, effect: 
         } else {
             brightness
         };
-        let led_on = LED_MASK[led / 32].load(Ordering::Relaxed) & (1 << (led % 32)) != 0;
+        // Ambient mode represents the display edge across every physical LED.
+        // The manual per-LED mask is for setup/effects and may contain saved
+        // exclusions, which should not leave gaps in the ambient output.
+        let led_on = ambient
+            || LED_MASK[led / 32].load(Ordering::Relaxed) & (1 << (led % 32)) != 0;
         if !powered || !led_on {
             (r, g, b) = (0, 0, 0);
         }
@@ -291,6 +295,7 @@ impl picoserve::response::ws::WebSocketCallback for LedWebSocket {
     {
         tx.send_binary(&LedState::current().to_packet()).await?;
         let mut message = [0u8; 66];
+        let mut ambient_ack_sent = false;
         loop {
             match rx
                 .next_message(&mut message, core::future::pending::<()>())
@@ -308,6 +313,12 @@ impl picoserve::response::ws::WebSocketCallback for LedWebSocket {
                             ((data[offset] as u32) << 16) | ((data[offset + 1] as u32) << 8) | data[offset + 2] as u32,
                             Ordering::Relaxed,
                         );
+                    }
+                    // Confirm the stream reached firmware without adding an
+                    // acknowledgement for every 30 Hz color update.
+                    if !ambient_ack_sent {
+                        tx.send_binary(&[0xA1, 1]).await?;
+                        ambient_ack_sent = true;
                     }
                 }
                 picoserve::futures::Either::First(Ok(

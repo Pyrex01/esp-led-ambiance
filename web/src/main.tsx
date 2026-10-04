@@ -60,11 +60,13 @@ function App() {
   const stateRef = useRef(state);
   const previousMaskRef = useRef<number[] | null>(null);
   const [ambientActive, setAmbientActive] = useState(false);
+  const [captureStarting, setCaptureStarting] = useState(false);
   const [captureStatus, setCaptureStatus] = useState("Choose a display to start capture");
   const [ambientColors, setAmbientColors] = useState<Rgb[]>([[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]]);
   const [monitors, setMonitors] = useState<DesktopMonitor[]>([]);
   const [selectedMonitor, setSelectedMonitor] = useState<number | null>(null);
   const ambientActiveRef = useRef(false);
+  const ambientPacketSentRef = useRef(false);
 
   const stopAmbient = useCallback((sendOff = true) => {
     if (isAmbientDesktop) void invoke("stop_capture");
@@ -85,13 +87,22 @@ function App() {
       setCaptureStatus("Select a display first");
       return;
     }
+    if (ws.current?.readyState !== WebSocket.OPEN) {
+      setCaptureStatus("Connect to the ESP32 before starting ambient mode");
+      return;
+    }
+    setCaptureStarting(true);
+    setCaptureStatus("Starting display capture…");
     try {
       await invoke("start_capture", { monitorId: selectedMonitor });
       ambientActiveRef.current = true;
+      ambientPacketSentRef.current = false;
       setAmbientActive(true);
       setCaptureStatus("Capturing display on this desktop");
     } catch (error) {
-      setCaptureStatus(error instanceof Error ? error.message : "Could not start display capture");
+      setCaptureStatus(typeof error === "string" ? error : error instanceof Error ? error.message : String(error));
+    } finally {
+      setCaptureStarting(false);
     }
   };
   const saveDeviceHost = () => {
@@ -120,6 +131,12 @@ function App() {
       const socket = ws.current;
       if (ambientActiveRef.current && socket?.readyState === WebSocket.OPEN && socket.bufferedAmount < 256) {
         socket.send(new Uint8Array([0xB1, 1, stateRef.current.brightness, ...colors.flat()]));
+        if (!ambientPacketSentRef.current) {
+          ambientPacketSentRef.current = true;
+          setCaptureStatus("Ambient colors sent; waiting for ESP32 acknowledgement");
+        }
+      } else if (ambientActiveRef.current && !ambientPacketSentRef.current && socket?.readyState !== WebSocket.OPEN) {
+        setCaptureStatus("Capture is active, but the ESP32 connection is not open");
       }
     }).then((unlisten) => { if (disposed) unlisten(); else unlistenColors = unlisten; });
     void listen<string>("ambient-capture-error", (event) => {
@@ -184,8 +201,13 @@ function App() {
         setConnectionStatus("connected");
       };
       socket.onmessage = (event) => {
-        if (!(event.data instanceof ArrayBuffer) || event.data.byteLength !== 6 + LED_MASK_BYTES) return;
+        if (!(event.data instanceof ArrayBuffer)) return;
         const bytes = new Uint8Array(event.data);
+        if (bytes.length === 2 && bytes[0] === 0xA1 && bytes[1] === 1) {
+          setCaptureStatus("Ambient stream reached the ESP32");
+          return;
+        }
+        if (bytes.length !== 6 + LED_MASK_BYTES) return;
         const restored: LedState = {
           power: bytes[0] !== 0,
           color: [bytes[1], bytes[2], bytes[3]],
@@ -247,7 +269,17 @@ function App() {
   }, []);
 
   const updateState = (updates: Partial<LedState>) => {
-    if (ambientActiveRef.current) stopAmbient(false);
+    if (ambientActiveRef.current) {
+      if (updates.brightness === undefined) return;
+      const newState = { ...stateRef.current, brightness: updates.brightness };
+      stateRef.current = newState;
+      setState(newState);
+      const socket = ws.current;
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(new Uint8Array([0xB1, 1, newState.brightness, ...ambientColors.flat()]));
+      }
+      return;
+    }
     const newState = { ...stateRef.current, ...updates };
     stateRef.current = newState;
     setState(newState);
@@ -371,6 +403,7 @@ function App() {
     }
   };
   const colorAt = (index: number): [number, number, number] => {
+    if (ambientActive) return ambientColors[Math.floor(index / LEDS_PER_SIDE)] ?? [0, 0, 0];
     if (state.pattern === 1 || state.pattern === 5) {
       const hue = ((index / LED_COUNT * 360 + phase * (state.pattern === 5 ? 2.4 : 1)) % 360);
       const chroma = 1 - Math.abs(2 * .55 - 1);
@@ -407,25 +440,25 @@ function App() {
           <div className="led-square-wrapper">
             <div className="led-square" role="group" aria-label="480 individually controlled LEDs, 120 per side">
               <svg className="led-map" viewBox="0 0 300 300" aria-label="Click or trace individual LED pixels to toggle them"
-                onPointerDown={startTrace} onPointerMove={(event) => { if (traceValueRef.current !== null) ledAtPointer(event); }}
+                aria-disabled={ambientActive} onPointerDown={ambientActive ? undefined : startTrace} onPointerMove={(event) => { if (!ambientActive && traceValueRef.current !== null) ledAtPointer(event); }}
                 onPointerUp={endTrace} onPointerCancel={endTrace}>
                 <path className="strip-track" d="M20 20 H280 V280 H20 Z" />
                 <defs>{stripSides.map((side, sideIndex) => <linearGradient key={sideIndex} id={`strip-gradient-${sideIndex}`} x1={side.from[0]} y1={side.from[1]} x2={side.to[0]} y2={side.to[1]} gradientUnits="userSpaceOnUse">
                   {Array.from({ length: LEDS_PER_SIDE }, (_, offset) => {
                     const index = sideIndex * LEDS_PER_SIDE + offset;
-                    const on = state.power && isLedOn(index);
+                    const on = ambientActive || (state.power && isLedOn(index));
                     const color = colorAt(index);
                     const pulse = state.pattern === 2 ? .15 + .85 * ((Math.sin(phase / 4) + 1) / 2) : 1;
                     const opacity = on ? Math.max(.08, state.brightness / 255) * pulse : .035;
                     return <stop key={offset} offset={`${offset / (LEDS_PER_SIDE - 1) * 100}%`} stopColor={rgbToHex(...color)} stopOpacity={opacity} />;
                   })}
                 </linearGradient>)}</defs>
-                {stripSides.map((side, index) => <path key={index} className="led-connections" d={side.path} stroke={`url(#strip-gradient-${index})`} style={{ filter: state.power ? `drop-shadow(0 0 5px ${rgbToHex(...state.color)})` : undefined }} />)}
+                {stripSides.map((side, index) => <path key={index} className="led-connections" d={side.path} stroke={`url(#strip-gradient-${index})`} style={{ filter: ambientActive ? `drop-shadow(0 0 5px ${rgbToHex(...ambientColors[index])})` : state.power ? `drop-shadow(0 0 5px ${rgbToHex(...state.color)})` : undefined }} />)}
                 {ledPoints.map(([x, y], index) => {
                   const on = isLedOn(index);
                   const paintLed = (value?: boolean) => setLed(index, value);
-                  return <g key={index} data-led-index={index} role="button" tabIndex={0} aria-label={`LED ${index + 1}, ${on ? "on" : "off"}`}
-                    onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") paintLed(); }}>
+                  return <g key={index} data-led-index={index} role="button" tabIndex={ambientActive ? -1 : 0} aria-disabled={ambientActive} aria-label={`LED ${index + 1}, ${on ? "on" : "off"}`}
+                    onKeyDown={(event) => { if (!ambientActive && (event.key === "Enter" || event.key === " ")) paintLed(); }}>
                     <circle cx={x} cy={y} r="7" className="led-hit" />
                   </g>;
                 })}
@@ -437,7 +470,7 @@ function App() {
         </section>
 
         <div className="shortcut-row">
-          <button className={`corner-shortcut ${cornersOnly ? "active" : ""}`} onClick={toggleCornersOnly} aria-pressed={cornersOnly}>
+          <button className={`corner-shortcut ${cornersOnly ? "active" : ""}`} onClick={toggleCornersOnly} aria-pressed={cornersOnly} disabled={ambientActive}>
             <ScanLine size={16} />
             <span>{cornersOnly ? "Restore previous LEDs" : "Corners only"}</span>
           </button>
@@ -453,9 +486,9 @@ function App() {
             {isAmbientDesktop && <select className="monitor-select" value={selectedMonitor ?? ""} onChange={(event) => setSelectedMonitor(Number(event.target.value))} disabled={ambientActive || monitors.length === 0} aria-label="Display to capture">
               {monitors.length === 0 ? <option value="">No displays found</option> : monitors.map((monitor) => <option key={monitor.id} value={monitor.id}>{monitor.name} ({monitor.width} × {monitor.height}){monitor.primary ? " · Primary" : ""}</option>)}
             </select>}
-            <button className={`ambient-toggle ${ambientActive ? "active" : ""}`} disabled={!isAmbientDesktop || (!ambientActive && selectedMonitor === null)} onClick={ambientActive ? () => stopAmbient() : startAmbient}>
+            <button className={`ambient-toggle ${ambientActive ? "active" : ""}`} disabled={!isAmbientDesktop || captureStarting || (!ambientActive && selectedMonitor === null)} onClick={ambientActive ? () => stopAmbient() : startAmbient}>
               {ambientActive ? <Square size={16} /> : <Monitor size={16} />}
-              {ambientActive ? "Stop capture" : "Start ambient"}
+              {ambientActive ? "Stop capture" : captureStarting ? "Starting…" : "Start ambient"}
             </button>
           </div>
           <p className="capture-status" aria-live="polite">{isAmbientDesktop ? captureStatus : "Ambient capture is available in the Linux or Windows desktop app only."}</p>
@@ -467,13 +500,13 @@ function App() {
 
         {isDesktopApp && <section className="device-card" aria-label="ESP32 connection">
           <label htmlFor="device-host">ESP32 address</label>
-          <input id="device-host" value={deviceHost} onChange={(event) => setDeviceHost(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") saveDeviceHost(); }} placeholder="192.168.1.42" />
-          <button onClick={saveDeviceHost}>Connect</button>
+          <input id="device-host" value={deviceHost} onChange={(event) => setDeviceHost(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") saveDeviceHost(); }} placeholder="192.168.1.42" disabled={ambientActive} />
+          <button onClick={saveDeviceHost} disabled={ambientActive}>Connect</button>
         </section>}
 
-        <section className="controls-grid">
+        <fieldset className="controls-grid">
           <div className="control-card power-card">
-            <button className={`power-btn ${state.power ? "on" : "off"}`} onClick={() => updateState({ power: !state.power })}>
+            <button className={`power-btn ${state.power ? "on" : "off"}`} onClick={() => updateState({ power: !state.power })} disabled={ambientActive}>
               <Power size={32} />
               <span>{state.power ? "Power On" : "Power Off"}</span>
             </button>
@@ -485,7 +518,7 @@ function App() {
               <h3>Brightness</h3>
               <span className="value-label">{Math.round((state.brightness / 255) * 100)}%</span>
             </div>
-            <input type="range" min="0" max="255" value={state.brightness} onChange={(e) => updateState({ brightness: parseInt(e.target.value) })} />
+            <input type="range" min="0" max="255" value={state.brightness} onChange={(e) => updateState({ brightness: parseInt(e.target.value) })} aria-label="LED brightness" />
           </div>
 
           <div className="control-card color-card">
@@ -495,16 +528,16 @@ function App() {
             </div>
             <div className="color-grid">
               {DEFAULT_PRESETS.map((color, i) => (
-                <button key={i} className="color-preset" style={{ backgroundColor: rgbToHex(...color) }} onClick={() => updateState({ color, power: true })} />
+                <button key={i} className="color-preset" style={{ backgroundColor: rgbToHex(...color) }} onClick={() => updateState({ color, power: true })} disabled={ambientActive} />
               ))}
               {customColors.map((color, i) => (
                 <div key={i} className="color-preset-wrapper" style={{ position: 'relative' }}>
-                  <button className="color-preset" style={{ backgroundColor: rgbToHex(...color) }} onClick={() => updateState({ color, power: true })} />
-                  <button className="remove-preset" onClick={() => removeCustomColor(i)}><Trash2 size={10} /></button>
+                  <button className="color-preset" style={{ backgroundColor: rgbToHex(...color) }} onClick={() => updateState({ color, power: true })} disabled={ambientActive} />
+                  <button className="remove-preset" onClick={() => removeCustomColor(i)} disabled={ambientActive}><Trash2 size={10} /></button>
                 </div>
               ))}
               <div className="custom-color-wrapper">
-                <input type="color" onChange={(e) => {
+                <input type="color" disabled={ambientActive} onChange={(e) => {
                   const color = hexToRgb(e.target.value);
                   updateState({ color, power: true });
                   addCustomColor(color);
@@ -521,13 +554,13 @@ function App() {
             </div>
             <div className="pattern-list">
               {PATTERNS.map((name, i) => (
-                <button key={i} className={`pattern-btn ${state.pattern === i ? "active" : ""}`} onClick={() => updateState({ pattern: i, power: true })}>
+                <button key={i} className={`pattern-btn ${state.pattern === i ? "active" : ""}`} onClick={() => updateState({ pattern: i, power: true })} disabled={ambientActive}>
                   {name}
                 </button>
               ))}
             </div>
           </div>
-        </section>
+        </fieldset>
       </div>
     </main>
   );

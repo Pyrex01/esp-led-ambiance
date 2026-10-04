@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { createRoot } from "react-dom/client";
-import { Power, Sun, Palette, Wand2, Plus, Trash2 } from "lucide-react";
+import { Power, Sun, Palette, Wand2, Plus, Trash2, Play } from "lucide-react";
 import "./style.css";
 
 interface LedState {
@@ -21,6 +21,7 @@ const DEFAULT_PRESETS: [number, number, number][] = [
 ];
 
 const PATTERNS = ["Solid", "Rainbow", "Pulse", "Chase", "Strobe", "Flow"];
+const initialFrames = ["#ff6b6b", "#ffd166", "#b9f18f", "#8fd3ff"];
 
 function App() {
   const [state, setState] = useState<LedState>({
@@ -32,6 +33,13 @@ function App() {
   });
 
   const [customColors, setCustomColors] = useState<[number, number, number][]>([]);
+  const [keyframes, setKeyframes] = useState(initialFrames);
+  const [duration, setDuration] = useState(500);
+  const [phase, setPhase] = useState(0);
+  const keyframesRef = useRef(keyframes);
+  const durationRef = useRef(duration);
+  keyframesRef.current = keyframes;
+  durationRef.current = duration;
   const [connectionStatus, setConnectionStatus] = useState<"connecting" | "reconnecting" | "connected">("connecting");
   const ws = useRef<WebSocket | null>(null);
   const stateRef = useRef(state);
@@ -82,6 +90,7 @@ function App() {
         setConnectionStatus("connected");
         const current = stateRef.current;
         socket.send(new Uint8Array([current.power ? 1 : 0, ...current.color, current.brightness, current.pattern, ...current.ledMask]));
+        if (current.pattern === 6) sendAnimation(socket);
       };
     socket.onclose = () => {
         if (ws.current === socket) ws.current = null;
@@ -114,6 +123,14 @@ function App() {
     };
   }, []);
 
+  const sendAnimation = (socket = ws.current) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    const colors = keyframesRef.current.slice(0, 8).map(hexToRgb);
+    const ms = durationRef.current;
+    const packet = new Uint8Array([0xA1, colors.length, ms & 255, ms >> 8, ...colors.flat()]);
+    socket.send(packet);
+  };
+
   useEffect(() => {
     return connect();
   }, [connect]);
@@ -139,6 +156,23 @@ function App() {
     setState(newState);
     sendUpdate(newState);
   };
+
+  useEffect(() => {
+    let frame = 0;
+    let lastStep = -1;
+    const tick = (time: number) => {
+      // The ESP32 emits a frame every 30 ms. Keep the preview in step with it
+      // and avoid rerendering the complete dashboard at the browser's 60 Hz.
+      const step = Math.floor(time / 30);
+      if (step !== lastStep) {
+        lastStep = step;
+        setPhase(step);
+      }
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, []);
 
   const rgbToHex = (r: number, g: number, b: number) => "#" + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('');
   const hexToRgb = (hex: string): [number, number, number] => {
@@ -229,11 +263,29 @@ function App() {
     return [20, 280 - t * 260];
   });
   const isLedOn = (index: number) => (state.ledMask[Math.floor(index / 8)] & (1 << (index % 8))) !== 0;
-  const litConnections = ledPoints.slice(0, -1).flatMap(([x1, y1], index) => {
-    if (Math.floor(index / LEDS_PER_SIDE) !== Math.floor((index + 1) / LEDS_PER_SIDE) || !isLedOn(index) || !isLedOn(index + 1)) return [];
-    const [x2, y2] = ledPoints[index + 1];
-    return [`M${x1},${y1} L${x2},${y2}`];
-  }).join(" ");
+  const colorAt = (index: number): [number, number, number] => {
+    if (state.pattern === 1 || state.pattern === 5) {
+      const hue = ((index / LED_COUNT * 360 + phase * (state.pattern === 5 ? 2.4 : 1)) % 360);
+      const chroma = 1 - Math.abs(2 * .55 - 1);
+      const x = chroma * (1 - Math.abs((hue / 60) % 2 - 1));
+      const m = .55 - chroma / 2;
+      const rgb = hue < 60 ? [chroma, x, 0] : hue < 120 ? [x, chroma, 0] : hue < 180 ? [0, chroma, x] : hue < 240 ? [0, x, chroma] : hue < 300 ? [x, 0, chroma] : [chroma, 0, x];
+      return rgb.map((v) => Math.round((v + m) * 255)) as [number, number, number];
+    }
+    if (state.pattern === 3 && (index + Math.floor(phase * 3)) % 24 >= 8) return [12, 14, 12];
+    if (state.pattern === 4 && Math.floor(phase) % 16 < 8) return [12, 14, 12];
+    if (state.pattern === 6 && keyframes.length) {
+      const idx = Math.floor(phase * 30 / duration) % keyframes.length;
+      return hexToRgb(keyframes[idx]);
+    }
+    return state.color;
+  };
+  const stripSides = [
+    { from: [20, 20], to: [280, 20], path: "M20 20 H280" },
+    { from: [280, 20], to: [280, 280], path: "M280 20 V280" },
+    { from: [280, 280], to: [20, 280], path: "M280 280 H20" },
+    { from: [20, 280], to: [20, 20], path: "M20 280 V20" },
+  ];
 
   return (
     <main className="shell">
@@ -254,32 +306,25 @@ function App() {
               <svg className="led-map" viewBox="0 0 300 300" aria-label="Click or trace individual LED pixels to toggle them"
                 onPointerDown={startTrace} onPointerMove={(event) => { if (traceValueRef.current !== null) ledAtPointer(event); }}
                 onPointerUp={endTrace} onPointerCancel={endTrace}>
-                {state.power && litConnections && <path className="led-connections" d={litConnections} style={{ stroke: rgbToHex(...state.color), filter: `drop-shadow(0 0 2px ${rgbToHex(...state.color)})`, opacity: Math.max(0.2, state.brightness / 255) }} />}
+                <path className="strip-track" d="M20 20 H280 V280 H20 Z" />
+                <defs>{stripSides.map((side, sideIndex) => <linearGradient key={sideIndex} id={`strip-gradient-${sideIndex}`} x1={side.from[0]} y1={side.from[1]} x2={side.to[0]} y2={side.to[1]} gradientUnits="userSpaceOnUse">
+                  {Array.from({ length: LEDS_PER_SIDE }, (_, offset) => {
+                    const index = sideIndex * LEDS_PER_SIDE + offset;
+                    const on = state.power && isLedOn(index);
+                    const color = colorAt(index);
+                    const pulse = state.pattern === 2 ? .15 + .85 * ((Math.sin(phase / 4) + 1) / 2) : 1;
+                    const opacity = on ? Math.max(.08, state.brightness / 255) * pulse : .035;
+                    return <stop key={offset} offset={`${offset / (LEDS_PER_SIDE - 1) * 100}%`} stopColor={rgbToHex(...color)} stopOpacity={opacity} />;
+                  })}
+                </linearGradient>)}</defs>
+                {stripSides.map((side, index) => <path key={index} className="led-connections" d={side.path} stroke={`url(#strip-gradient-${index})`} style={{ filter: state.power ? `drop-shadow(0 0 5px ${rgbToHex(...state.color)})` : undefined }} />)}
                 {ledPoints.map(([x, y], index) => {
                   const on = isLedOn(index);
-                  const vertical = Math.floor(index / LEDS_PER_SIDE) % 2 === 1;
-                  const segmentLength = 260 / LEDS_PER_SIDE;
                   const paintLed = (value?: boolean) => setLed(index, value);
                   return <g key={index} data-led-index={index} role="button" tabIndex={0} aria-label={`LED ${index + 1}, ${on ? "on" : "off"}`}
                     onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") paintLed(); }}>
-                    <circle cx={x} cy={y} r="3.5" className="led-hit" />
-                    <rect
-                      x={x - (vertical ? 6 : segmentLength / 2)}
-                      y={y - (vertical ? segmentLength / 2 : 6)}
-                      width={vertical ? 12 : segmentLength}
-                      height={vertical ? segmentLength : 12}
-                      rx="1.5"
-                      className={`digital-led ${on && state.power ? "lit" : ""}`}
-                      style={on && state.power ? { fill: rgbToHex(...state.color), opacity: Math.max(0.2, state.brightness / 255) } : undefined} />
+                    <circle cx={x} cy={y} r="7" className="led-hit" />
                   </g>;
-                })}
-                {Array.from({ length: 4 }, (_, corner) => {
-                  const previousIndex = (corner + 1) * LEDS_PER_SIDE - 1;
-                  const nextIndex = (corner + 1) * LEDS_PER_SIDE % LED_COUNT;
-                  if (!state.power || !isLedOn(previousIndex) || !isLedOn(nextIndex)) return null;
-                  const [cx, cy] = [[280, 20], [280, 280], [20, 280], [20, 20]][corner];
-                  return <rect key={`corner-${corner}`} x={cx - 6} y={cy - 6} width="12" height="12" rx="1.5"
-                    fill={rgbToHex(...state.color)} opacity={Math.max(0.2, state.brightness / 255)} pointerEvents="none" />;
                 })}
                 <text x="150" y="142" className="square-label">4 SIDES</text>
                 <text x="150" y="159" className="square-sub-label">120 LEDs EACH</text>
@@ -342,6 +387,14 @@ function App() {
                   {name}
                 </button>
               ))}
+              <button className={`pattern-btn ${state.pattern === 6 ? "active" : ""}`} onClick={() => updateState({ pattern: 6, power: true })}>My animation</button>
+            </div>
+            <div className="animation-editor">
+              <div className="editor-heading"><span>Build a loop</span><button onClick={() => setKeyframes([...keyframes, "#8f8cff"].slice(0, 8))} disabled={keyframes.length >= 8}><Plus size={14}/> Add color</button></div>
+              <div className="keyframe-row">{keyframes.map((color, i) => <div className="keyframe" key={i}><input aria-label={`Animation color ${i + 1}`} type="color" value={color} onChange={(e) => setKeyframes(keyframes.map((item, index) => index === i ? e.target.value : item))}/>{keyframes.length > 2 && <button aria-label="Remove color" onClick={() => setKeyframes(keyframes.filter((_, index) => index !== i))}><Trash2 size={12}/></button>}</div>)}</div>
+              <label className="duration-label">Transition time <span>{(duration / 1000).toFixed(1)} sec</span></label>
+              <input type="range" min="200" max="3000" step="100" value={duration} onChange={(e) => setDuration(Number(e.target.value))}/>
+              <button className="apply-animation" onClick={() => { updateState({ pattern: 6, power: true }); sendAnimation(); }}><Play size={14} fill="currentColor"/> Play on LEDs</button>
             </div>
           </div>
         </section>

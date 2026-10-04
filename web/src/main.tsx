@@ -148,7 +148,69 @@ function App() {
     return [r, g, b];
   };
 
-  const [traceValue, setTraceValue] = useState<boolean | null>(null);
+  const traceValueRef = useRef<boolean | null>(null);
+  const previousTraceIndexRef = useRef<number | null>(null);
+  const paintTraceIndex = (index: number) => {
+    const value = traceValueRef.current;
+    const previousIndex = previousTraceIndexRef.current;
+    if (value === null) return;
+
+    const mask = stateRef.current.ledMask.slice();
+    const indices = [index];
+    if (previousIndex !== null) {
+      const forward = (index - previousIndex + LED_COUNT) % LED_COUNT;
+      const step = forward <= LED_COUNT / 2 ? 1 : -1;
+      const distance = step === 1 ? forward : LED_COUNT - forward;
+      for (let offset = 1; offset < distance; offset++) {
+        indices.push((previousIndex + step * offset + LED_COUNT) % LED_COUNT);
+      }
+    }
+    let changed = false;
+    for (const ledIndex of indices) {
+      const byteIndex = Math.floor(ledIndex / 8);
+      const bit = 1 << (ledIndex % 8);
+      const nextByte = value ? mask[byteIndex] | bit : mask[byteIndex] & ~bit;
+      if (nextByte !== mask[byteIndex]) {
+        mask[byteIndex] = nextByte;
+        changed = true;
+      }
+    }
+    previousTraceIndexRef.current = index;
+    if (changed) updateState({ ledMask: mask });
+  };
+  const ledAtPointer = (event: React.PointerEvent<SVGSVGElement>) => {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const x = (event.clientX - bounds.left) / bounds.width * 300;
+    const y = (event.clientY - bounds.top) / bounds.height * 300;
+    let nearest = -1;
+    let nearestDistance = Infinity;
+    ledPoints.forEach(([ledX, ledY], index) => {
+      const distance = (ledX - x) ** 2 + (ledY - y) ** 2;
+      if (distance < nearestDistance) {
+        nearest = index;
+        nearestDistance = distance;
+      }
+    });
+    if (nearestDistance <= 24 ** 2) paintTraceIndex(nearest);
+  };
+  const startTrace = (event: React.PointerEvent<SVGSVGElement>) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    event.preventDefault();
+    const target = event.target as Element;
+    const ledGroup = target.closest("[data-led-index]");
+    const index = ledGroup ? Number(ledGroup.getAttribute("data-led-index")) : -1;
+    if (index < 0) return;
+    const value = !isLedOn(index);
+    traceValueRef.current = value;
+    previousTraceIndexRef.current = index;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    paintTraceIndex(index);
+  };
+  const endTrace = (event: React.PointerEvent<SVGSVGElement>) => {
+    traceValueRef.current = null;
+    previousTraceIndexRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  };
   const setLed = (index: number, value?: boolean) => {
     const mask = stateRef.current.ledMask.slice();
     const byteIndex = Math.floor(index / 8);
@@ -188,20 +250,36 @@ function App() {
 
         <section className="visualizer-section">
           <div className="led-square-wrapper">
-            <div className="led-square" role="group" aria-label="480 individually controlled LEDs, 120 per side" onPointerUp={() => setTraceValue(null)} onPointerLeave={() => setTraceValue(null)}>
-              <svg className="led-map" viewBox="0 0 300 300" aria-label="Click or trace individual LED pixels to toggle them">
+            <div className="led-square" role="group" aria-label="480 individually controlled LEDs, 120 per side">
+              <svg className="led-map" viewBox="0 0 300 300" aria-label="Click or trace individual LED pixels to toggle them"
+                onPointerDown={startTrace} onPointerMove={(event) => { if (traceValueRef.current !== null) ledAtPointer(event); }}
+                onPointerUp={endTrace} onPointerCancel={endTrace}>
                 {state.power && litConnections && <path className="led-connections" d={litConnections} style={{ stroke: rgbToHex(...state.color), filter: `drop-shadow(0 0 2px ${rgbToHex(...state.color)})`, opacity: Math.max(0.2, state.brightness / 255) }} />}
                 {ledPoints.map(([x, y], index) => {
                   const on = isLedOn(index);
+                  const vertical = Math.floor(index / LEDS_PER_SIDE) % 2 === 1;
+                  const segmentLength = 260 / LEDS_PER_SIDE;
                   const paintLed = (value?: boolean) => setLed(index, value);
-                  return <g key={index} role="button" tabIndex={0} aria-label={`LED ${index + 1}, ${on ? "on" : "off"}`}
-                    onPointerDown={(event) => { event.preventDefault(); const value = !on; setTraceValue(value); paintLed(value); }}
-                    onPointerEnter={() => { if (traceValue !== null) paintLed(traceValue); }}
+                  return <g key={index} data-led-index={index} role="button" tabIndex={0} aria-label={`LED ${index + 1}, ${on ? "on" : "off"}`}
                     onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") paintLed(); }}>
-                    <circle cx={x} cy={y} r="2" className="led-hit" />
-                    <circle cx={x} cy={y} r="1.25" className={`digital-led ${on && state.power ? "lit" : ""}`}
+                    <circle cx={x} cy={y} r="3.5" className="led-hit" />
+                    <rect
+                      x={x - (vertical ? 6 : segmentLength / 2)}
+                      y={y - (vertical ? segmentLength / 2 : 6)}
+                      width={vertical ? 12 : segmentLength}
+                      height={vertical ? segmentLength : 12}
+                      rx="1.5"
+                      className={`digital-led ${on && state.power ? "lit" : ""}`}
                       style={on && state.power ? { fill: rgbToHex(...state.color), opacity: Math.max(0.2, state.brightness / 255) } : undefined} />
                   </g>;
+                })}
+                {Array.from({ length: 4 }, (_, corner) => {
+                  const previousIndex = (corner + 1) * LEDS_PER_SIDE - 1;
+                  const nextIndex = (corner + 1) * LEDS_PER_SIDE % LED_COUNT;
+                  if (!state.power || !isLedOn(previousIndex) || !isLedOn(nextIndex)) return null;
+                  const [cx, cy] = [[280, 20], [280, 280], [20, 280], [20, 20]][corner];
+                  return <rect key={`corner-${corner}`} x={cx - 6} y={cy - 6} width="12" height="12" rx="1.5"
+                    fill={rgbToHex(...state.color)} opacity={Math.max(0.2, state.brightness / 255)} pointerEvents="none" />;
                 })}
                 <text x="150" y="142" className="square-label">4 SIDES</text>
                 <text x="150" y="159" className="square-sub-label">120 LEDs EACH</text>

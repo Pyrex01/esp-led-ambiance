@@ -14,6 +14,19 @@ npm run build
 cd ..
 ```
 
+## Run the web app on a development computer
+
+Connect the computer and ESP32 to the same Wi-Fi network, then run Vite with
+the ESP32's IP address. Vite proxies the page's `/ws` connection to the device:
+
+```sh
+cd web
+ESP32_HOST=http://192.168.1.42 yarn dev
+```
+
+Replace `192.168.1.42` with the address printed by the ESP32 serial monitor.
+The default proxy target is `http://192.168.4.1`.
+
 ## Build and flash firmware
 
 The Wi-Fi access point name and password are set in `src/bin/main.rs`:

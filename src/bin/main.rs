@@ -12,7 +12,7 @@ use embassy_executor::Spawner;
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources};
 use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
-use esp_hal::gpio::Level;
+use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::rmt::{PulseCode, Rmt, TxChannelConfig, TxChannelCreator};
 use esp_hal::rng::Rng;
 use esp_hal::time::Rate;
@@ -28,12 +28,15 @@ use practice_esp::mk_static;
 
 const SSID: &str = "Enchanter";
 const PASSWORD: &str = "Khanhome";
-const LED_COUNT: usize = 600;
+const LEDS_PER_SIDE: usize = 120;
+const LED_COUNT: usize = LEDS_PER_SIDE * 4;
+const LED_MASK_WORDS: usize = LED_COUNT / 32;
 const WS2812_BITS_PER_LED: usize = 24;
 const WS2812_RESET_CODES: usize = 1;
 const WS2812_FRAME_CODES: usize = LED_COUNT * WS2812_BITS_PER_LED + WS2812_RESET_CODES;
 static LED_COLOR_POWER: AtomicU32 = AtomicU32::new(0x80FF_A500);
 static LED_EFFECT: AtomicU32 = AtomicU32::new((128 << 8) | 0);
+static LED_MASK: [AtomicU32; LED_MASK_WORDS] = [const { AtomicU32::new(u32::MAX) }; LED_MASK_WORDS];
 static WIFI_CONNECT_FAILED: AtomicBool = AtomicBool::new(false);
 
 // Keep the large, fixed waveform buffer out of the runtime heap used for task stacks.
@@ -95,7 +98,8 @@ fn fill_led_frame(frame: &mut [PulseCode], phase: u8, color_power: u32, effect: 
         } else {
             brightness
         };
-        if !powered {
+        let led_on = LED_MASK[led / 32].load(Ordering::Relaxed) & (1 << (led % 32)) != 0;
+        if !powered || !led_on {
             (r, g, b) = (0, 0, 0);
         }
         r = scale(r, pulse_brightness);
@@ -126,7 +130,7 @@ impl picoserve::response::ws::WebSocketCallback for LedWebSocket {
         R: picoserve::io::Read,
         W: picoserve::io::Write<Error = R::Error>,
     {
-        let mut message = [0u8; 16];
+        let mut message = [0u8; 66];
         loop {
             match rx
                 .next_message(&mut message, core::future::pending::<()>())
@@ -134,7 +138,7 @@ impl picoserve::response::ws::WebSocketCallback for LedWebSocket {
             {
                 picoserve::futures::Either::First(Ok(
                     picoserve::response::ws::Message::Binary(data),
-                )) if data.len() == 6 => {
+                )) if data.len() == 6 + LED_COUNT / 8 => {
                     let powered = data[0] != 0;
                     let color_power = ((powered as u32) << 31)
                         | ((data[1] as u32) << 16)
@@ -145,6 +149,13 @@ impl picoserve::response::ws::WebSocketCallback for LedWebSocket {
                         ((data[4] as u32) << 8) | data[5].min(5) as u32,
                         Ordering::Relaxed,
                     );
+                    for word in 0..LED_MASK_WORDS {
+                        let offset = 6 + word * 4;
+                        let bits = u32::from_le_bytes([
+                            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                        ]);
+                        LED_MASK[word].store(bits, Ordering::Relaxed);
+                    }
                 }
                 picoserve::futures::Either::First(Ok(picoserve::response::ws::Message::Close(
                     _,
@@ -241,6 +252,9 @@ async fn main(spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(config);
     esp_alloc::heap_allocator!(size: 98_767);
 
+    // GPIO 5 follows the power state selected in the web UI.
+    let mut power_output = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
+
     let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).expect("failed to initialize RMT");
     let tx_config = TxChannelConfig::default().with_clk_divider(2);
     let mut led_channel = rmt
@@ -291,7 +305,7 @@ async fn main(spawner: Spawner) -> ! {
 
     status_channel = wait_for_network(stack, status_channel, &mut status_frame).await;
     spawner.spawn(http_server(stack).expect("failed to create HTTP server task"));
-    // Keep the onboard indicator off while the 600-pixel strip is running.
+    // Keep the onboard indicator off while the 480-pixel strip is running.
     fill_status_frame(&mut status_frame, 0, 0, 0);
     status_channel
         .transmit(&status_frame)
@@ -301,6 +315,11 @@ async fn main(spawner: Spawner) -> ! {
 
     let mut phase = 0u8;
     loop {
+        if LED_COLOR_POWER.load(Ordering::Relaxed) & 0x8000_0000 != 0 {
+            power_output.set_high();
+        } else {
+            power_output.set_low();
+        }
         fill_led_frame(
             led_frame,
             phase,

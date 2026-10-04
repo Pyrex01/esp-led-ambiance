@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { createRoot } from "react-dom/client";
-import { Power, Sun, Palette, Wand2, Plus, Trash2 } from "lucide-react";
+import { Power, Sun, Palette, Wand2, Plus, Trash2, ScanLine } from "lucide-react";
 import "./style.css";
 
 interface LedState {
@@ -15,6 +15,18 @@ const LEDS_PER_SIDE = 120;
 const LED_COUNT = LEDS_PER_SIDE * 4;
 const LED_MASK_BYTES = LED_COUNT / 8;
 const FULL_LED_MASK = Array<number>(LED_MASK_BYTES).fill(0xff);
+const CORNER_ARM_LENGTH = 12;
+const CORNER_LED_MASK = (() => {
+  const mask = Array<number>(LED_MASK_BYTES).fill(0);
+  for (let side = 0; side < 4; side++) {
+    for (let offset = 0; offset < CORNER_ARM_LENGTH; offset++) {
+      for (const index of [side * LEDS_PER_SIDE + offset, side * LEDS_PER_SIDE + LEDS_PER_SIDE - 1 - offset]) {
+        mask[Math.floor(index / 8)] |= 1 << (index % 8);
+      }
+    }
+  }
+  return mask;
+})();
 
 const DEFAULT_PRESETS: [number, number, number][] = [
   [255, 255, 255], [200, 230, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 0, 255], [255, 165, 0], [0, 255, 255],
@@ -36,6 +48,7 @@ function App() {
   const [connectionStatus, setConnectionStatus] = useState<"connecting" | "reconnecting" | "connected">("connecting");
   const ws = useRef<WebSocket | null>(null);
   const stateRef = useRef(state);
+  const previousMaskRef = useRef<number[] | null>(null);
 
   useEffect(() => {
     const saved = localStorage.getItem("customColors");
@@ -258,6 +271,16 @@ function App() {
     return [20, 280 - t * 260];
   });
   const isLedOn = (index: number) => (state.ledMask[Math.floor(index / 8)] & (1 << (index % 8))) !== 0;
+  const cornersOnly = state.ledMask.every((byte, index) => byte === CORNER_LED_MASK[index]);
+  const toggleCornersOnly = () => {
+    if (cornersOnly) {
+      updateState({ ledMask: previousMaskRef.current?.slice() ?? FULL_LED_MASK.slice() });
+      previousMaskRef.current = null;
+    } else {
+      previousMaskRef.current = stateRef.current.ledMask.slice();
+      updateState({ ledMask: CORNER_LED_MASK.slice() });
+    }
+  };
   const colorAt = (index: number): [number, number, number] => {
     if (state.pattern === 1 || state.pattern === 5) {
       const hue = ((index / LED_COUNT * 360 + phase * (state.pattern === 5 ? 2.4 : 1)) % 360);
@@ -323,6 +346,14 @@ function App() {
             </div>
           </div>
         </section>
+
+        <div className="shortcut-row">
+          <button className={`corner-shortcut ${cornersOnly ? "active" : ""}`} onClick={toggleCornersOnly} aria-pressed={cornersOnly}>
+            <ScanLine size={16} />
+            <span>{cornersOnly ? "Restore previous LEDs" : "Corners only"}</span>
+          </button>
+          <span className="shortcut-hint">4 corner L shapes · {CORNER_ARM_LENGTH} LEDs per arm</span>
+        </div>
 
         <section className="controls-grid">
           <div className="control-card power-card">

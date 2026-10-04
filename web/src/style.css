@@ -79,6 +79,52 @@ h1 {
   margin-bottom: 48px;
 }
 
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin: -30px 0 32px;
+}
+
+.corner-shortcut {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 13px;
+  border: 1px solid rgba(185, 241, 143, 0.28);
+  border-radius: 999px;
+  background: rgba(185, 241, 143, 0.08);
+  color: #d8f5c5;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+}
+
+.corner-shortcut:hover {
+  background: rgba(185, 241, 143, 0.15);
+  border-color: rgba(185, 241, 143, 0.55);
+}
+
+.corner-shortcut:active { transform: scale(0.97); }
+
+.corner-shortcut:focus-visible {
+  outline: 2px solid #b9f18f;
+  outline-offset: 3px;
+}
+
+.corner-shortcut.active {
+  background: rgba(185, 241, 143, 0.2);
+  border-color: rgba(185, 241, 143, 0.65);
+}
+
+.shortcut-hint {
+  color: rgba(247, 247, 242, 0.42);
+  font-size: 0.75rem;
+}
+
 .led-square-wrapper {
   padding: 20px;
 }
@@ -312,6 +358,7 @@ input[type="range"]::-webkit-slider-thumb {
 
 @media (max-width: 600px) {
   .container { padding: 16px; }
+  .shortcut-row { flex-direction: column; gap: 8px; margin-top: -32px; }
   .controls-grid {
     grid-template-columns: 1fr;
     gap: 12px;

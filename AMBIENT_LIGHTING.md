@@ -45,7 +45,7 @@ The current firmware has `/ws` and accepts a 66-byte control packet (power,
 RGB, brightness, effect, and a 480-LED mask), plus a custom animation packet.
 Ambient mode uses a distinct packet so the smaller message is unambiguous.
 
-The v1 binary packet is 14 bytes:
+The v1 binary packet is 15 bytes:
 
 | Offset | Size | Meaning |
 | --- | ---: | --- |
@@ -57,7 +57,8 @@ The v1 binary packet is 14 bytes:
 The PC sends only the latest ambient state at a modest rate (initial target:
 30 updates/second or less). If the link is congested, it should discard stale
 samples instead of queueing old colors. At 30 updates/second, the payload is
-420 bytes/second before WebSocket/TCP overhead.
+450 bytes/second before WebSocket/TCP overhead. Colors are sRGB as sampled from
+the screen; firmware converts them to linear light before driving the LEDs.
 
 This packet is implemented by the current firmware and desktop UI. The existing
 66-byte manual control message remains available for individual LED selection

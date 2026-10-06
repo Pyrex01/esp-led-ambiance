@@ -10,6 +10,8 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use esp_hal::clock::CpuClock;
@@ -50,11 +52,19 @@ const SETTINGS_SLOT_SIZE: u32 = 0x1000;
 const SETTINGS_MAGIC: u32 = 0x4C45_4453;
 const SETTINGS_RECORD_SIZE: usize = 80;
 const OTA_CHUNK_SIZE: usize = 4096;
+/// Ambient packet: type, flags, brightness, then four RGB triplets.
+const AMBIENT_PACKET_LEN: usize = 3 + 4 * 3;
 static OTA_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static LED_COLOR_POWER: AtomicU32 = AtomicU32::new(0x80FF_A500);
 static LED_EFFECT: AtomicU32 = AtomicU32::new((128 << 8) | 0);
 static AMBIENT_ACTIVE: AtomicBool = AtomicBool::new(false);
+// Ambient power and brightness are kept apart from LED_COLOR_POWER/LED_EFFECT
+// so the 30 Hz stream never overwrites the manual settings saved to flash.
+static AMBIENT_POWERED: AtomicBool = AtomicBool::new(false);
+static AMBIENT_BRIGHTNESS: AtomicU32 = AtomicU32::new(0);
 static AMBIENT_COLORS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+// Wakes the render loop as soon as an ambient packet arrives.
+static AMBIENT_UPDATED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static LED_MASK: [AtomicU32; LED_MASK_WORDS] = [const { AtomicU32::new(u32::MAX) }; LED_MASK_WORDS];
 static WIFI_CONNECT_FAILED: AtomicBool = AtomicBool::new(false);
 
@@ -198,20 +208,49 @@ fn crc32(bytes: &[u8]) -> u32 {
 }
 
 /// Encode a WS2812 bit using a 40 MHz RMT clock (25 ns per tick).
-fn ws2812_bit(bit: bool) -> PulseCode {
+const fn ws2812_bit(bit: bool) -> PulseCode {
     let (high, low) = if bit { (32, 18) } else { (16, 34) };
     PulseCode::new(Level::High, high, Level::Low, low)
 }
 
-fn fill_status_frame(frame: &mut [PulseCode; 25], red: u8, green: u8, blue: u8) {
-    let mut cursor = 0;
-    // The onboard LED on ESP32-S3-DevKitC-1 is WS2812-compatible and uses GRB order.
-    for byte in [green, red, blue] {
-        for bit in (0..8).rev() {
-            frame[cursor] = ws2812_bit(byte & (1 << bit) != 0);
-            cursor += 1;
-        }
+const WS2812_ZERO: PulseCode = ws2812_bit(false);
+const WS2812_ONE: PulseCode = ws2812_bit(true);
+
+/// Write one LED's 24 pulse codes. WS2812 LEDs receive color bytes in GRB
+/// order, most significant bit first.
+fn encode_led(codes: &mut [PulseCode], red: u8, green: u8, blue: u8) {
+    let bits = ((green as u32) << 16) | ((red as u32) << 8) | blue as u32;
+    for (index, code) in codes[..WS2812_BITS_PER_LED].iter_mut().enumerate() {
+        *code = if bits & (1 << (23 - index)) != 0 { WS2812_ONE } else { WS2812_ZERO };
     }
+}
+
+/// sRGB to linear light, 8 bits in and out. Screen colors are gamma encoded
+/// while WS2812 PWM is linear; sending sRGB values unchanged lifts mid and
+/// low channels, which makes mixed colors look washed out and whitish.
+#[rustfmt::skip]
+static SRGB_TO_LINEAR: [u8; 256] = [
+    0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7,
+    8, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11, 11, 12, 12, 12, 13,
+    13, 13, 14, 14, 15, 15, 16, 16, 17, 17, 17, 18, 18, 19, 19, 20,
+    20, 21, 22, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 29, 29,
+    30, 30, 31, 32, 32, 33, 34, 35, 35, 36, 37, 37, 38, 39, 40, 41,
+    41, 42, 43, 44, 45, 45, 46, 47, 48, 49, 50, 51, 51, 52, 53, 54,
+    55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70,
+    71, 72, 73, 74, 76, 77, 78, 79, 80, 81, 82, 84, 85, 86, 87, 88,
+    90, 91, 92, 93, 95, 96, 97, 99, 100, 101, 103, 104, 105, 107, 108, 109,
+    111, 112, 114, 115, 116, 118, 119, 121, 122, 124, 125, 127, 128, 130, 131, 133,
+    134, 136, 138, 139, 141, 142, 144, 146, 147, 149, 151, 152, 154, 156, 157, 159,
+    161, 163, 164, 166, 168, 170, 171, 173, 175, 177, 179, 181, 183, 184, 186, 188,
+    190, 192, 194, 196, 198, 200, 202, 204, 206, 208, 210, 212, 214, 216, 218, 220,
+    222, 224, 226, 229, 231, 233, 235, 237, 239, 242, 244, 246, 248, 250, 253, 255,
+];
+
+fn fill_status_frame(frame: &mut [PulseCode; 25], red: u8, green: u8, blue: u8) {
+    // The onboard LED on ESP32-S3-DevKitC-1 is WS2812-compatible and uses GRB order.
+    encode_led(frame, red, green, blue);
     frame[24] = PulseCode::new(Level::Low, 12_000, Level::Low, 0);
 }
 
@@ -230,64 +269,96 @@ fn scale(value: u8, brightness: u8) -> u8 {
 }
 
 fn fill_led_frame(frame: &mut [PulseCode], phase: u8, color_power: u32, effect: u32) {
-    let mut cursor = 0;
+    if AMBIENT_ACTIVE.load(Ordering::Relaxed) {
+        fill_ambient_frame(frame);
+    } else {
+        fill_manual_frame(frame, phase, color_power, effect);
+    }
+    // A 300 us low reset works with WS2812 variants that require a longer latch time.
+    frame[LED_COUNT * WS2812_BITS_PER_LED] = PulseCode::new(Level::Low, 12_000, Level::Low, 0);
+}
+
+/// Ambient mode represents the display edge across every physical LED. The
+/// manual per-LED mask is for setup/effects and may contain saved exclusions,
+/// which should not leave gaps in the ambient output.
+fn fill_ambient_frame(frame: &mut [PulseCode]) {
+    let powered = AMBIENT_POWERED.load(Ordering::Relaxed);
+    let brightness = AMBIENT_BRIGHTNESS.load(Ordering::Relaxed) as u8;
+    let sides = frame[..LED_COUNT * WS2812_BITS_PER_LED].chunks_exact_mut(LEDS_PER_SIDE * WS2812_BITS_PER_LED);
+    for (side_codes, side_color) in sides.zip(&AMBIENT_COLORS) {
+        let color = if powered { side_color.load(Ordering::Relaxed) } else { 0 };
+        let channel = |shift: u32| scale(SRGB_TO_LINEAR[((color >> shift) & 0xff) as usize], brightness);
+        // Encode the side's color once and copy it to all of its LEDs.
+        let mut codes = [WS2812_ZERO; WS2812_BITS_PER_LED];
+        encode_led(&mut codes, channel(16), channel(8), channel(0));
+        for led in side_codes.chunks_exact_mut(WS2812_BITS_PER_LED) {
+            led.copy_from_slice(&codes);
+        }
+    }
+}
+
+fn fill_manual_frame(frame: &mut [PulseCode], phase: u8, color_power: u32, effect: u32) {
     let powered = color_power & 0x8000_0000 != 0;
     let red = ((color_power >> 16) & 0xff) as u8;
     let green = ((color_power >> 8) & 0xff) as u8;
     let blue = (color_power & 0xff) as u8;
     let brightness = ((effect >> 8) & 0xff) as u8;
     let pattern = (effect & 0xff) as u8;
-    let ambient = AMBIENT_ACTIVE.load(Ordering::Relaxed);
+    let pulse_brightness = if pattern == 2 {
+        let triangle = if phase < 128 { phase } else { 255 - phase };
+        (triangle as u16 * 2) as u8
+    } else {
+        brightness
+    };
 
+    let mut previous = None;
+    let mut codes = [WS2812_ZERO; WS2812_BITS_PER_LED];
     for led in 0..LED_COUNT {
-        let (mut r, mut g, mut b) = if ambient {
-            let side = led / LEDS_PER_SIDE;
-            let color = AMBIENT_COLORS[side].load(Ordering::Relaxed);
-            (
-                ((color >> 16) & 0xff) as u8,
-                ((color >> 8) & 0xff) as u8,
-                (color & 0xff) as u8,
-            )
-        } else {
-            match pattern {
-                1 => wheel(((led * 256 / LED_COUNT) as u8).wrapping_add(phase)),
-                3 if (led + phase as usize * 3) % 24 >= 8 => (0, 0, 0),
-                4 if phase % 16 < 8 => (0, 0, 0),
-                5 => wheel(((led * 256 / LED_COUNT) as u8).wrapping_add(phase.wrapping_mul(2))),
-                _ => (red, green, blue),
-            }
+        let (mut r, mut g, mut b) = match pattern {
+            1 => wheel(((led * 256 / LED_COUNT) as u8).wrapping_add(phase)),
+            3 if (led + phase as usize * 3) % 24 >= 8 => (0, 0, 0),
+            4 if phase % 16 < 8 => (0, 0, 0),
+            5 => wheel(((led * 256 / LED_COUNT) as u8).wrapping_add(phase.wrapping_mul(2))),
+            _ => (red, green, blue),
         };
-
-        let pulse_brightness = if ambient {
-            brightness
-        } else if pattern == 2 {
-            let triangle = if phase < 128 { phase } else { 255 - phase };
-            (triangle as u16 * 2) as u8
-        } else {
-            brightness
-        };
-        // Ambient mode represents the display edge across every physical LED.
-        // The manual per-LED mask is for setup/effects and may contain saved
-        // exclusions, which should not leave gaps in the ambient output.
-        let led_on = ambient
-            || LED_MASK[led / 32].load(Ordering::Relaxed) & (1 << (led % 32)) != 0;
+        let led_on = LED_MASK[led / 32].load(Ordering::Relaxed) & (1 << (led % 32)) != 0;
         if !powered || !led_on {
             (r, g, b) = (0, 0, 0);
         }
-        r = scale(r, pulse_brightness);
-        g = scale(g, pulse_brightness);
-        b = scale(b, pulse_brightness);
+        let rgb = (scale(r, pulse_brightness), scale(g, pulse_brightness), scale(b, pulse_brightness));
 
-        // WS2812 LEDs receive color bytes in GRB order, most significant bit first.
-        for byte in [g, r, b] {
-            for bit in (0..8).rev() {
-                frame[cursor] = ws2812_bit(byte & (1 << bit) != 0);
-                cursor += 1;
-            }
+        // Most frames are long runs of one color; reuse the previous LED's codes.
+        if previous != Some(rgb) {
+            encode_led(&mut codes, rgb.0, rgb.1, rgb.2);
+            previous = Some(rgb);
         }
+        let cursor = led * WS2812_BITS_PER_LED;
+        frame[cursor..cursor + WS2812_BITS_PER_LED].copy_from_slice(&codes);
     }
-    // A 300 us low reset works with WS2812 variants that require a longer latch time.
-    frame[LED_COUNT * WS2812_BITS_PER_LED] = PulseCode::new(Level::Low, 12_000, Level::Low, 0);
+}
+
+fn apply_ambient_packet(data: &[u8]) {
+    AMBIENT_POWERED.store(data[1] & 1 != 0, Ordering::Relaxed);
+    AMBIENT_BRIGHTNESS.store(data[2] as u32, Ordering::Relaxed);
+    for side in 0..4 {
+        let offset = 3 + side * 3;
+        AMBIENT_COLORS[side].store(
+            ((data[offset] as u32) << 16) | ((data[offset + 1] as u32) << 8) | data[offset + 2] as u32,
+            Ordering::Relaxed,
+        );
+    }
+    AMBIENT_ACTIVE.store(true, Ordering::Relaxed);
+    AMBIENT_UPDATED.signal(());
+}
+
+/// Turn the strip off when the ambient stream ends. Ambient mode stays
+/// selected until a manual packet arrives, so the saved manual state is not
+/// shown, or overwritten, by a closed desktop connection.
+fn stop_ambient() {
+    if AMBIENT_ACTIVE.load(Ordering::Relaxed) {
+        AMBIENT_POWERED.store(false, Ordering::Relaxed);
+        AMBIENT_UPDATED.signal(());
+    }
 }
 
 struct LedWebSocket;
@@ -312,17 +383,8 @@ impl picoserve::response::ws::WebSocketCallback for LedWebSocket {
             {
                 picoserve::futures::Either::First(Ok(
                     picoserve::response::ws::Message::Binary(data),
-                )) if data.len() == 14 && data[0] == 0xB1 => {
-                    AMBIENT_ACTIVE.store(true, Ordering::Relaxed);
-                    LED_COLOR_POWER.store(((data[1] & 1 != 0) as u32) << 31, Ordering::Relaxed);
-                    LED_EFFECT.store((data[2] as u32) << 8, Ordering::Relaxed);
-                    for side in 0..4 {
-                        let offset = 3 + side * 3;
-                        AMBIENT_COLORS[side].store(
-                            ((data[offset] as u32) << 16) | ((data[offset + 1] as u32) << 8) | data[offset + 2] as u32,
-                            Ordering::Relaxed,
-                        );
-                    }
+                )) if data.len() == AMBIENT_PACKET_LEN && data[0] == 0xB1 => {
+                    apply_ambient_packet(data);
                     // Confirm the stream reached firmware without adding an
                     // acknowledgement for every 30 Hz color update.
                     if !ambient_ack_sent {
@@ -356,18 +418,12 @@ impl picoserve::response::ws::WebSocketCallback for LedWebSocket {
                     }
                 }
                 picoserve::futures::Either::First(Ok(picoserve::response::ws::Message::Close(_))) => {
-                    if AMBIENT_ACTIVE.load(Ordering::Relaxed) {
-                        AMBIENT_ACTIVE.store(false, Ordering::Relaxed);
-                        LED_COLOR_POWER.store(0, Ordering::Relaxed);
-                    }
+                    stop_ambient();
                     return Ok(());
                 }
                 picoserve::futures::Either::First(Ok(_)) => {}
                 picoserve::futures::Either::First(Err(_)) => {
-                    if AMBIENT_ACTIVE.load(Ordering::Relaxed) {
-                        AMBIENT_ACTIVE.store(false, Ordering::Relaxed);
-                        LED_COLOR_POWER.store(0, Ordering::Relaxed);
-                    }
+                    stop_ambient();
                     return Ok(());
                 }
                 picoserve::futures::Either::Second(()) => continue,
@@ -541,7 +597,12 @@ async fn main(spawner: Spawner) -> ! {
     let mut persisted_state = restored_state.unwrap_or(observed_state);
     let mut unsaved_for_ms = 0u32;
     loop {
-        if LED_COLOR_POWER.load(Ordering::Relaxed) & 0x8000_0000 != 0 {
+        let powered = if AMBIENT_ACTIVE.load(Ordering::Relaxed) {
+            AMBIENT_POWERED.load(Ordering::Relaxed)
+        } else {
+            LED_COLOR_POWER.load(Ordering::Relaxed) & 0x8000_0000 != 0
+        };
+        if powered {
             power_output.set_high();
         } else {
             power_output.set_low();
@@ -577,7 +638,9 @@ async fn main(spawner: Spawner) -> ! {
         } else {
             unsaved_for_ms = 0;
         }
-        Timer::after(Duration::from_millis(30)).await;
+        // Effects advance one phase step per 30 ms. Ambient frames are rendered
+        // as soon as a packet arrives instead of waiting for the next tick.
+        let _ = embassy_time::with_timeout(Duration::from_millis(30), AMBIENT_UPDATED.wait()).await;
     }
 }
 

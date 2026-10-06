@@ -105,3 +105,64 @@ keep that table and `partitions.csv` together when flashing the firmware.
 
 Browsers request Brotli by default, and the ESP replies with
 `Content-Encoding: br`.
+
+## Simulate with Wokwi before flashing
+
+[Wokwi](https://wokwi.com) simulates the ESP32-S3 with Wi-Fi, the 480-pixel
+WS2812 frame on GPIO 4, the GPIO 5 power output (green LED), and the custom
+partition table, so OTA slots and the `led_state` flash partition behave as on
+hardware.
+
+The `wokwi` Cargo feature connects to the simulator's open `Wokwi-GUEST`
+access point instead of the real network. Build the firmware and merged flash
+image:
+
+```sh
+./wokwi-build.sh
+```
+
+`diagram.json` describes the circuit. The four strips follow the firmware's
+order: top (left→right), right (top→bottom), bottom (right→left), and left
+(bottom→top). `wokwi.toml` points at `target/wokwi-flash.bin` and the ELF.
+
+### Run in VS Code or RustRover
+
+Install the Wokwi extension (VS Code: `wokwi.wokwi-vscode`, or the Wokwi
+Simulator plugin for JetBrains), run **Wokwi: Request a New License**, then
+open `diagram.json` and start the simulator. With the private gateway, the web
+UI is reachable at <http://localhost:8180>. Point the dev server at it with:
+
+```sh
+cd web
+ESP32_HOST=http://localhost:8180 yarn dev
+```
+
+### Run headless with wokwi-cli
+
+Create a token at <https://wokwi.com/dashboard/ci> and export it as
+`WOKWI_CLI_TOKEN`, then:
+
+```sh
+wokwi-cli --diagram-file ../diagram.json --timeout 30000 \
+    --expect-text "Serving React app" wokwi-ci
+```
+
+`wokwi-ci/wokwi.toml` leaves out the GDB server. The root `wokwi.toml` enables
+it, which makes `wokwi-cli` pause at reset until a debugger attaches.
+
+### Debug with GDB
+
+`wokwi.toml` exposes a GDB server on port 3333. Start the simulation in your
+editor (use **Wokwi: Start Simulator and Wait for Debugger** to pause at
+reset), then attach:
+
+```sh
+xtensa-esp32s3-elf-gdb target/xtensa-esp32s3-none-elf/release/practice-esp \
+    -ex "target remote localhost:3333"
+```
+
+Use `break`, not `hbreak`; the simulator only supports software breakpoints.
+For `wokwi-cli`, pass `-g 3333` to the headless config instead.
+
+Get the GDB build from
+[espressif/binutils-gdb releases](https://github.com/espressif/binutils-gdb/releases).

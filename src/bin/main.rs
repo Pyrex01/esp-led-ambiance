@@ -18,6 +18,8 @@ use esp_hal::rmt::{PulseCode, Rmt, TxChannelConfig, TxChannelCreator};
 use esp_hal::rng::Rng;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
+#[cfg(feature = "wokwi")]
+use esp_radio::wifi::AuthenticationMethod;
 use esp_radio::wifi::{Config, Interface, WifiController, sta::StationConfig};
 use esp_storage::FlashStorage;
 use log::{error, info, warn};
@@ -28,8 +30,15 @@ use picoserve::routing::PathRouterService;
 use practice_esp::assets::{ASSETS, Asset};
 use practice_esp::mk_static;
 
+#[cfg(not(feature = "wokwi"))]
 const SSID: &str = "Enchanter";
+#[cfg(not(feature = "wokwi"))]
 const PASSWORD: &str = "Khanhome";
+// The Wokwi simulator provides an open access point on channel 6.
+#[cfg(feature = "wokwi")]
+const SSID: &str = "Wokwi-GUEST";
+#[cfg(feature = "wokwi")]
+const PASSWORD: &str = "";
 const LEDS_PER_SIDE: usize = 120;
 const LED_COUNT: usize = LEDS_PER_SIDE * 4;
 const LED_MASK_WORDS: usize = LED_COUNT / 32;
@@ -391,11 +400,14 @@ async fn connection(mut controller: WifiController<'static>) {
 
         WIFI_CONNECT_FAILED.store(false, Ordering::Relaxed);
 
-        let station_config = Config::Station(
-            StationConfig::default()
-                .with_ssid(SSID)
-                .with_password(PASSWORD.into()),
-        );
+        let station_config = StationConfig::default()
+            .with_ssid(SSID)
+            .with_password(PASSWORD.into());
+        #[cfg(feature = "wokwi")]
+        let station_config = station_config
+            .with_auth_method(AuthenticationMethod::None)
+            .with_channel(6);
+        let station_config = Config::Station(station_config);
 
         controller
             .set_config(&station_config)

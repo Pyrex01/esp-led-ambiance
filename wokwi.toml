@@ -1,0 +1,17 @@
+# Wokwi simulator config. Build the image first with ./wokwi-build.sh
+[wokwi]
+version = 1
+# Merged flash image: bootloader + partitions.csv (OTA slots, led_state) + app.
+firmware = 'target/wokwi-flash.bin'
+# ELF gives symbols for GDB and panic backtraces.
+elf = 'target/xtensa-esp32s3-none-elf/release/practice-esp'
+# Attach xtensa-esp32s3-elf-gdb to localhost:3333 for source-level debugging.
+gdbServerPort = 3333
+# Serial port over the network (rfc2217://localhost:4000) for external monitors.
+rfc2217ServerPort = 4000
+
+# Reach the simulated web server at http://localhost:8180
+# (VS Code / JetBrains extensions; needs the Wokwi private gateway).
+[[net.forward]]
+from = "localhost:8180"
+to = "target:80"

@@ -1,0 +1,6 @@
+# Headless config for wokwi-cli. The root wokwi.toml enables the GDB server,
+# which makes wokwi-cli pause at reset until a debugger attaches.
+[wokwi]
+version = 1
+firmware = '../target/wokwi-flash.bin'
+elf = '../target/xtensa-esp32s3-none-elf/release/practice-esp'

@@ -32,6 +32,10 @@ static_cell      = "2.1.1"
 picoserve = { version = "0.17.1", default-features = false, features = ["embassy", "log", "ws"] }
 esp-storage = { version = "0.7.0", features = ["esp32s3"] }
 
+[features]
+# Build for the Wokwi simulator (connects to the virtual "Wokwi-GUEST" access point).
+wokwi = []
+
 [build-dependencies]
 flate2   = "1.0"
 walkdir  = "2.5.0"

@@ -496,7 +496,8 @@ async fn http_server(stack: Stack<'static>) {
     let config = picoserve::Config::new(picoserve::Timeouts {
         start_read_request: Some(Duration::from_secs(5)),
         persistent_start_read_request: Some(Duration::from_secs(1)),
-        read_request: Some(Duration::from_secs(1)),
+        // Applies to every body read, so it also bounds stalls during an OTA upload.
+        read_request: Some(Duration::from_secs(5)),
         write: Some(Duration::from_secs(5)),
     });
 
@@ -518,6 +519,10 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
     esp_alloc::heap_allocator!(size: 98_767);
+
+    if let Err(err) = confirm_booted_ota_slot() {
+        warn!("Could not confirm the booted OTA slot: {:?}", err);
+    }
 
     let (mut state_store, restored_state) = StateStore::load();
     if let Some(state) = restored_state {
@@ -758,6 +763,53 @@ impl<State> PathRouterService<State> for EmbeddedAssets {
     }
 }
 
+/// Points otadata at the running app slot and marks it valid.
+///
+/// After a USB flash otadata is blank, and esp-bootloader-esp-idf then picks
+/// the running slot as the OTA target. Selecting the booted slot here makes
+/// every update go to the other slot, and marking it valid keeps a bootloader
+/// with rollback enabled from reverting a good update.
+#[allow(
+    clippy::large_stack_frames,
+    reason = "runs once at boot before any other task needs the stack"
+)]
+fn confirm_booted_ota_slot() -> Result<(), esp_bootloader_esp_idf::partitions::Error> {
+    use esp_bootloader_esp_idf::ota::OtaImageState;
+    use esp_bootloader_esp_idf::ota_updater::OtaUpdater;
+    use esp_bootloader_esp_idf::partitions::{
+        self, AppPartitionSubType, DataPartitionSubType, Error, PartitionType,
+    };
+
+    let mut flash = FlashStorage::new();
+    let mut buffer = [0u8; partitions::PARTITION_TABLE_MAX_LEN];
+    let table = partitions::read_partition_table(&mut flash, &mut buffer)?;
+    let booted = match table.booted_partition()?.map(|part| part.partition_type()) {
+        Some(PartitionType::App(subtype)) if subtype != AppPartitionSubType::Factory => subtype,
+        _ => return Err(Error::Invalid),
+    };
+    let ota_data = table
+        .find_partition(PartitionType::Data(DataPartitionSubType::Ota))?
+        .ok_or(Error::Invalid)?;
+    let (ota_data_start, ota_data_end) = (ota_data.offset(), ota_data.offset() + ota_data.len());
+
+    let selected = OtaUpdater::new(&mut flash, &mut buffer)?.selected_partition();
+    if selected != Ok(booted) {
+        // Blank, stale or rolled-back otadata: rebuild it around the running slot.
+        info!("Selecting booted app slot {:?} in otadata", booted);
+        flash
+            .erase(ota_data_start, ota_data_end)
+            .map_err(|_| Error::StorageError)?;
+        OtaUpdater::new(&mut flash, &mut buffer)?.ota_data()?.set_current_app_partition(booted)?;
+    }
+
+    let mut updater = OtaUpdater::new(&mut flash, &mut buffer)?;
+    if updater.current_ota_state()? != OtaImageState::Valid {
+        updater.set_current_ota_state(OtaImageState::Valid)?;
+    }
+    info!("Running from OTA slot {:?}", booted);
+    Ok(())
+}
+
 async fn handle_firmware_update<R, W>(
     mut request: Request<'_, R>,
     response_writer: W,
@@ -769,6 +821,7 @@ where
     let body = request.body_connection.body();
     let image_len = body.content_length();
     if image_len < 24 || image_len > 0x1F_0000 {
+        warn!("OTA rejected: image size {} bytes", image_len);
         return (StatusCode::BAD_REQUEST, "Invalid firmware image size")
             .write_to(request.body_connection.finalize().await?, response_writer)
             .await;
@@ -778,6 +831,14 @@ where
             .write_to(request.body_connection.finalize().await?, response_writer)
             .await;
     }
+    info!("OTA started: {} bytes", image_len);
+
+    // Flash or partition problems are the device's fault (500); a bad or
+    // truncated upload is the client's (400).
+    let flash_error = |err: esp_bootloader_esp_idf::partitions::Error| {
+        error!("OTA flash error: {:?}", err);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Firmware update failed: flash error")
+    };
 
     // Stream and align writes to the flash driver's 4-byte write requirement.
     let mut reader = body.reader();
@@ -788,14 +849,25 @@ where
             &mut flash,
             &mut partition_table,
         )
-        .map_err(|_| ())?;
+        .map_err(flash_error)?;
+        // With blank otadata the library would target the running slot;
+        // confirm_booted_ota_slot() prevents that at boot, so refuse otherwise.
+        if updater.selected_partition().map_err(flash_error)?
+            == esp_bootloader_esp_idf::partitions::AppPartitionSubType::Factory
         {
-            let (mut partition, _) = updater.next_partition().map_err(|_| ())?;
-            if image_len > partition.partition_size() {
-                return Err(());
-            }
+            error!("OTA refused: otadata does not select the running slot");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "OTA slots are not initialized"));
+        }
+        {
+            let (mut partition, slot) = updater.next_partition().map_err(flash_error)?;
+            info!("OTA writing to slot {:?}", slot);
             let erase_len = (image_len + 0xFFF) & !0xFFF;
-            partition.erase(0, erase_len as u32).map_err(|_| ())?;
+            // The flash region's erase rejects an end equal to the partition size.
+            if erase_len >= partition.partition_size() {
+                warn!("OTA rejected: image does not fit the app slot");
+                return Err((StatusCode::BAD_REQUEST, "Firmware image is too large"));
+            }
+            partition.erase(0, erase_len as u32).map_err(flash_error)?;
 
             let mut buffer = [0xFFu8; OTA_CHUNK_SIZE];
             let mut offset = 0usize;
@@ -804,23 +876,29 @@ where
                 let count = (image_len - offset).min(OTA_CHUNK_SIZE);
                 let mut filled = 0;
                 while filled < count {
-                    let read = futures_read(&mut reader, &mut buffer[filled..count]).await?;
-                    if read == 0 {
-                        return Err(());
+                    let read = futures_read(&mut reader, &mut buffer[filled..count]).await;
+                    match read {
+                        Ok(0) | Err(()) => {
+                            warn!("OTA upload ended at {} of {} bytes", offset + filled, image_len);
+                            return Err((StatusCode::BAD_REQUEST, "Firmware upload was interrupted"));
+                        }
+                        Ok(read) => filled += read,
                     }
-                    filled += read;
                 }
                 if first && buffer[0] != 0xE9 {
-                    return Err(());
+                    warn!("OTA rejected: image magic 0x{:02X}, expected 0xE9", buffer[0]);
+                    return Err((StatusCode::BAD_REQUEST, "Not an ESP application image"));
                 }
                 first = false;
                 let write_len = (count + 3) & !3;
-                partition.write(offset as u32, &buffer[..write_len]).map_err(|_| ())?;
+                partition
+                    .write(offset as u32, &buffer[..write_len])
+                    .map_err(flash_error)?;
                 offset += count;
                 buffer.fill(0xFF);
             }
         }
-        updater.activate_next_partition().map_err(|_| ())?;
+        updater.activate_next_partition().map_err(flash_error)?;
         Ok(())
     }
     .await;
@@ -828,18 +906,18 @@ where
     // Ensure the body is consumed and release the connection before sending a response.
     let connection = request.body_connection.finalize().await?;
     OTA_IN_PROGRESS.store(false, Ordering::Release);
-    if result.is_ok() {
-        let _response = (StatusCode::OK, "Firmware installed; restarting now.")
-            .write_to(connection, response_writer)
-            .await?;
-        Timer::after(Duration::from_millis(300)).await;
-        esp_hal::system::software_reset();
-        #[allow(unreachable_code)]
-        Ok(_response)
-    } else {
-        (StatusCode::BAD_REQUEST, "Firmware update failed")
-            .write_to(connection, response_writer)
-            .await
+    match result {
+        Ok(()) => {
+            info!("OTA complete; restarting");
+            let _response = (StatusCode::OK, "Firmware installed; restarting now.")
+                .write_to(connection, response_writer)
+                .await?;
+            Timer::after(Duration::from_millis(300)).await;
+            esp_hal::system::software_reset();
+            #[allow(unreachable_code)]
+            Ok(_response)
+        }
+        Err(response) => response.write_to(connection, response_writer).await,
     }
 }
 

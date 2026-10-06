@@ -3,4 +3,4 @@
 size = "4MB"
 
 [idf]
-partition_table = "../partitions.bin"
+partition_table = "../partitions.csv"

@@ -92,6 +92,10 @@ This builds the firmware, saves an ESP32-S3 application image, uploads it to
 images must fit within the 1.875 MB app slots. Keep USB available for the first
 OTA-capable flash or recovery if an update is interrupted by power loss.
 
+At boot the firmware points `otadata` at the slot it is running from and marks
+it valid, so each OTA writes the other slot. USB flashes (`cargo run`) always
+write `ota_0` and erase `otadata`, so the device boots the image just flashed.
+
 The serial monitor prints the assigned URL, for example:
 
 ```text
@@ -100,8 +104,8 @@ Serving React app at http://192.168.1.42/
 
 The firmware saves the LED power, color, effect, and per-LED mask to the
 `led_state` flash partition after changes settle, then restores them at boot.
-`espflash.toml` selects the custom 4 MB partition table in `partitions.bin`;
-keep that table and `partitions.csv` together when flashing the firmware.
+`espflash.toml` selects the custom 4 MB partition table in `partitions.csv`.
+OTA cannot change the partition table, so edits to it need a USB flash.
 
 Browsers request Brotli by default, and the ESP replies with
 `Content-Encoding: br`.

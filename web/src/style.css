@@ -406,3 +406,18 @@ input[type="range"]::-webkit-slider-thumb {
     grid-template-columns: repeat(6, 1fr);
   }
 }
+
+.orientation-card { margin: 0 0 20px; padding: 20px; border: 1px solid rgba(255,255,255,.08); border-radius: 16px; background: rgba(255,255,255,.035); }
+.orientation-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.orientation-heading h2 { display: flex; align-items: center; gap: 8px; margin: 4px 0 0; font-size: 1.1rem; }
+.mode-switch { display: inline-flex; padding: 3px; border: 1px solid rgba(255,255,255,.12); border-radius: 999px; background: #10120f; }
+.mode-switch button { padding: 7px 14px; border: 0; border-radius: 999px; background: transparent; color: rgba(247,247,242,.6); font: inherit; font-size: .8rem; cursor: pointer; }
+.mode-switch button.active { background: rgba(185,241,143,.18); color: #d8f5c5; }
+.mode-switch button:disabled { opacity: .35; cursor: not-allowed; }
+.orientation-manual { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 14px; }
+.orientation-manual label { color: rgba(247,247,242,.6); font-size: .82rem; }
+.orientation-reading { margin: 14px 0 0; color: #d8f5c5; font-size: .9rem; font-variant-numeric: tabular-nums; }
+.direction-label { fill: rgba(247,247,242,.45); font-size: 10px; font-weight: 700; text-anchor: middle; dominant-baseline: central; pointer-events: none; }
+.direction-label.north { fill: #ff7a6b; }
+.led-map g.map-rotation { cursor: default; }
+@media (max-width: 640px) { .orientation-heading { align-items: flex-start; flex-direction: column; } }

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { createRoot } from "react-dom/client";
-import { Power, Sun, Palette, Wand2, Plus, Trash2, ScanLine, Monitor, Square } from "lucide-react";
+import { Power, Sun, Palette, Wand2, Plus, Trash2, ScanLine, Monitor, Square, Compass } from "lucide-react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./style.css";
@@ -37,10 +37,46 @@ const DEFAULT_PRESETS: [number, number, number][] = [
 const PATTERNS = ["Solid", "Rainbow", "Pulse", "Chase", "Strobe", "Flow"];
 type Rgb = [number, number, number];
 
+// Ambient colors arrive as zones running clockwise around the screen, in the
+// same order as the LEDs (top left→right, right top→bottom, and so on).
+const AMBIENT_ZONES_PER_SIDE = 16;
+const AMBIENT_ZONES = AMBIENT_ZONES_PER_SIDE * 4;
+const AMBIENT_OFF_PACKET_COLORS = Array<number>(AMBIENT_ZONES * 3).fill(0);
+const BLACK_ZONES = (): Rgb[] => Array.from({ length: AMBIENT_ZONES }, () => [0, 0, 0]);
+// Blend the two zone centers either side of an LED, as the firmware does.
+const ambientColorAt = (zones: Rgb[], led: number): Rgb => {
+  const position = ((led + 0.5) * AMBIENT_ZONES / LED_COUNT - 0.5 + AMBIENT_ZONES) % AMBIENT_ZONES;
+  const zone = Math.floor(position);
+  const fraction = position - zone;
+  const from = zones[zone];
+  const to = zones[(zone + 1) % AMBIENT_ZONES];
+  return from.map((channel, index) => Math.round(channel + (to[index] - channel) * fraction)) as Rgb;
+};
+
 interface DesktopMonitor { id: number; name: string; width: number; height: number; primary: boolean }
 
 const isAmbientDesktop = isTauri() && /(Linux|Windows)/i.test(navigator.userAgent);
 const isDesktopApp = isTauri();
+
+// Physical mounting: the top strip faces south and the left strip faces east,
+// so in strip order (top, right, bottom, left) the sides face S, W, N, E.
+const SIDE_NAMES = ["Top", "Right", "Bottom", "Left"];
+const SIDE_FACING = ["S", "W", "N", "E"];
+const DIRECTIONS = [
+  { label: "North", heading: 0 }, { label: "East", heading: 90 }, { label: "South", heading: 180 }, { label: "West", heading: 270 },
+];
+const COMPASS_POINTS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+type OrientationMode = "compass" | "manual";
+const hasOrientationSensor = typeof window !== "undefined" && "DeviceOrientationEvent" in window;
+const needsOrientationPermission = hasOrientationSensor &&
+  typeof (DeviceOrientationEvent as unknown as { requestPermission?: unknown }).requestPermission === "function";
+// Browsers only expose orientation sensors to secure (HTTPS) pages.
+const compassUnavailableReason = hasOrientationSensor ? "" : window.isSecureContext
+  ? "This device has no orientation sensor; set the direction manually."
+  : `The compass needs HTTPS. On Android Chrome, add ${location.origin} at chrome://flags/#unsafely-treat-insecure-origin-as-secure and relaunch Chrome.`;
+const isTouchDevice = matchMedia("(pointer: coarse)").matches;
+const normalizeHeading = (heading: number) => ((heading % 360) + 360) % 360;
+const compassPoint = (heading: number) => COMPASS_POINTS[Math.round(normalizeHeading(heading) / 45) % 8];
 
 function App() {
   const [state, setState] = useState<LedState>({
@@ -62,16 +98,38 @@ function App() {
   const [ambientActive, setAmbientActive] = useState(false);
   const [captureStarting, setCaptureStarting] = useState(false);
   const [captureStatus, setCaptureStatus] = useState("Choose a display to start capture");
-  const [ambientColors, setAmbientColors] = useState<Rgb[]>([[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]]);
+  const [ambientColors, setAmbientColors] = useState<Rgb[]>(BLACK_ZONES);
   const [monitors, setMonitors] = useState<DesktopMonitor[]>([]);
   const [selectedMonitor, setSelectedMonitor] = useState<number | null>(null);
   const ambientActiveRef = useRef(false);
   const ambientPacketSentRef = useRef(false);
+  const [orientationMode, setOrientationMode] = useState<OrientationMode>(() => {
+    const saved = localStorage.getItem("orientationMode");
+    if (saved === "compass" || saved === "manual") return saved;
+    return hasOrientationSensor && !isDesktopApp && isTouchDevice ? "compass" : "manual";
+  });
+  // Compass direction the top of the screen points towards. On a desktop this
+  // is the direction you face when looking at the monitor.
+  const [manualHeading, setManualHeading] = useState(() => {
+    const saved = localStorage.getItem("manualHeading");
+    return DIRECTIONS.find((direction) => String(direction.heading) === saved)?.heading ?? 180;
+  });
+  // Unwrapped (may exceed 0–360) so the map turns the short way across north.
+  const [compassHeading, setCompassHeading] = useState<number | null>(null);
+  const [compassStatus, setCompassStatus] = useState("");
+  const [compassPermission, setCompassPermission] = useState(!needsOrientationPermission);
+  const compassActive = orientationMode === "compass" && compassHeading !== null;
+  const viewHeading = compassActive ? compassHeading : manualHeading;
+  // Screen edge i (top, right, bottom, left) lights strip side (i + turns) % 4.
+  const ambientQuarterTurns = ((Math.round(normalizeHeading(viewHeading) / 90) - 2) % 4 + 4) % 4;
+  const ambientQuarterTurnsRef = useRef(ambientQuarterTurns);
+  ambientQuarterTurnsRef.current = ambientQuarterTurns;
+  const mapGroupRef = useRef<SVGGElement | null>(null);
 
   const stopAmbient = useCallback((sendOff = true) => {
     if (isAmbientDesktop) void invoke("stop_capture");
     if (sendOff && ws.current?.readyState === WebSocket.OPEN) {
-      ws.current.send(new Uint8Array([0xB1, 0, stateRef.current.brightness, ...Array(12).fill(0)]));
+      ws.current.send(new Uint8Array([0xB1, 0, stateRef.current.brightness, ...AMBIENT_OFF_PACKET_COLORS]));
     }
     ambientActiveRef.current = false;
     setAmbientActive(false);
@@ -126,7 +184,10 @@ function App() {
       if (primary) setSelectedMonitor(primary.id);
     }).catch((error) => { if (!disposed) setCaptureStatus(String(error)); });
     void listen<Rgb[]>("ambient-colors", (event) => {
-      const colors = event.payload;
+      // Turning the sides keeps the clockwise order, so rotating the ring of zones is enough.
+      const colors = BLACK_ZONES();
+      const shift = ambientQuarterTurnsRef.current * AMBIENT_ZONES_PER_SIDE;
+      event.payload.forEach((color, zone) => { colors[(zone + shift) % AMBIENT_ZONES] = color; });
       setAmbientColors(colors);
       const socket = ws.current;
       if (ambientActiveRef.current && socket?.readyState === WebSocket.OPEN && socket.bufferedAmount < 256) {
@@ -144,7 +205,7 @@ function App() {
       setAmbientActive(false);
       ambientActiveRef.current = false;
       if (ws.current?.readyState === WebSocket.OPEN) {
-        ws.current.send(new Uint8Array([0xB1, 0, stateRef.current.brightness, ...Array(12).fill(0)]));
+        ws.current.send(new Uint8Array([0xB1, 0, stateRef.current.brightness, ...AMBIENT_OFF_PACKET_COLORS]));
       }
     }).then((unlisten) => { if (disposed) unlisten(); else unlistenError = unlisten; });
     return () => {
@@ -154,6 +215,77 @@ function App() {
       unlistenError?.();
     };
   }, []);
+
+  useEffect(() => {
+    if (orientationMode !== "compass") {
+      setCompassHeading(null);
+      setCompassStatus("");
+      return;
+    }
+    if (!hasOrientationSensor) {
+      setCompassStatus(compassUnavailableReason);
+      return;
+    }
+    if (!compassPermission) {
+      setCompassStatus("Tap “Enable compass” to allow motion & orientation access");
+      return;
+    }
+    let lastRendered: number | null = null;
+    let smoothed: number | null = null;
+    setCompassStatus("Waiting for compass…");
+    const onOrientation = (event: DeviceOrientationEvent) => {
+      const webkitHeading = (event as DeviceOrientationEvent & { webkitCompassHeading?: number }).webkitCompassHeading;
+      let raw: number;
+      if (typeof webkitHeading === "number" && !Number.isNaN(webkitHeading)) raw = webkitHeading;
+      else if (event.absolute && event.alpha !== null) raw = 360 - event.alpha;
+      else return;
+      // Alpha describes the device's natural top; follow the screen's top when rotated.
+      raw += screen.orientation?.angle ?? 0;
+      if (smoothed === null) smoothed = raw;
+      else smoothed += ((((raw - smoothed) % 360) + 540) % 360 - 180) * 0.25;
+      if (lastRendered === null || Math.abs(smoothed - lastRendered) > 0.5) {
+        lastRendered = smoothed;
+        setCompassHeading(smoothed);
+        setCompassStatus("");
+      }
+    };
+    const noData = setTimeout(() => {
+      if (smoothed === null) {
+        setCompassStatus(window.isSecureContext
+          ? "No compass data from this device; set the direction manually"
+          : "No compass data — browsers only expose the compass over HTTPS; set the direction manually");
+      }
+    }, 3000);
+    window.addEventListener("deviceorientationabsolute" as "deviceorientation", onOrientation);
+    window.addEventListener("deviceorientation", onOrientation);
+    return () => {
+      clearTimeout(noData);
+      window.removeEventListener("deviceorientationabsolute" as "deviceorientation", onOrientation);
+      window.removeEventListener("deviceorientation", onOrientation);
+      setCompassHeading(null);
+    };
+  }, [orientationMode, compassPermission]);
+
+  const requestCompassPermission = async () => {
+    try {
+      const request = (DeviceOrientationEvent as unknown as { requestPermission: () => Promise<string> }).requestPermission;
+      const result = await request();
+      if (result === "granted") setCompassPermission(true);
+      else setCompassStatus("Compass access was denied; set the direction manually");
+    } catch (error) {
+      setCompassStatus(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const chooseOrientationMode = (mode: OrientationMode) => {
+    localStorage.setItem("orientationMode", mode);
+    setOrientationMode(mode);
+  };
+
+  const chooseManualHeading = (heading: number) => {
+    localStorage.setItem("manualHeading", String(heading));
+    setManualHeading(heading);
+  };
 
   useEffect(() => {
     const saved = localStorage.getItem("customColors");
@@ -342,9 +474,10 @@ function App() {
     if (changed) updateState({ ledMask: mask });
   };
   const ledAtPointer = (event: React.PointerEvent<SVGSVGElement>) => {
-    const bounds = event.currentTarget.getBoundingClientRect();
-    const x = (event.clientX - bounds.left) / bounds.width * 300;
-    const y = (event.clientY - bounds.top) / bounds.height * 300;
+    // Map the pointer into the (possibly rotated) strip coordinates.
+    const ctm = mapGroupRef.current?.getScreenCTM();
+    if (!ctm) return;
+    const { x, y } = new DOMPoint(event.clientX, event.clientY).matrixTransform(ctm.inverse());
     let nearest = -1;
     let nearestDistance = Infinity;
     ledPoints.forEach(([ledX, ledY], index) => {
@@ -403,7 +536,7 @@ function App() {
     }
   };
   const colorAt = (index: number): [number, number, number] => {
-    if (ambientActive) return ambientColors[Math.floor(index / LEDS_PER_SIDE)] ?? [0, 0, 0];
+    if (ambientActive) return ambientColorAt(ambientColors, index);
     if (state.pattern === 1 || state.pattern === 5) {
       const hue = ((index / LED_COUNT * 360 + phase * (state.pattern === 5 ? 2.4 : 1)) % 360);
       const chroma = 1 - Math.abs(2 * .55 - 1);
@@ -439,9 +572,10 @@ function App() {
         <section className="visualizer-section">
           <div className="led-square-wrapper">
             <div className="led-square" role="group" aria-label="480 individually controlled LEDs, 120 per side">
-              <svg className="led-map" viewBox="0 0 300 300" aria-label="Click or trace individual LED pixels to toggle them"
+              <svg className="led-map" viewBox={compassActive ? "-40 -40 380 380" : "-14 -14 328 328"} aria-label="Click or trace individual LED pixels to toggle them"
                 aria-disabled={ambientActive} onPointerDown={ambientActive ? undefined : startTrace} onPointerMove={(event) => { if (!ambientActive && traceValueRef.current !== null) ledAtPointer(event); }}
                 onPointerUp={endTrace} onPointerCancel={endTrace}>
+                <g ref={mapGroupRef} className="map-rotation" transform={`rotate(${180 - viewHeading} 150 150)`}>
                 <path className="strip-track" d="M20 20 H280 V280 H20 Z" />
                 <defs>{stripSides.map((side, sideIndex) => <linearGradient key={sideIndex} id={`strip-gradient-${sideIndex}`} x1={side.from[0]} y1={side.from[1]} x2={side.to[0]} y2={side.to[1]} gradientUnits="userSpaceOnUse">
                   {Array.from({ length: LEDS_PER_SIDE }, (_, offset) => {
@@ -453,7 +587,7 @@ function App() {
                     return <stop key={offset} offset={`${offset / (LEDS_PER_SIDE - 1) * 100}%`} stopColor={rgbToHex(...color)} stopOpacity={opacity} />;
                   })}
                 </linearGradient>)}</defs>
-                {stripSides.map((side, index) => <path key={index} className="led-connections" d={side.path} stroke={`url(#strip-gradient-${index})`} style={{ filter: ambientActive ? `drop-shadow(0 0 5px ${rgbToHex(...ambientColors[index])})` : state.power ? `drop-shadow(0 0 5px ${rgbToHex(...state.color)})` : undefined }} />)}
+                {stripSides.map((side, index) => <path key={index} className="led-connections" d={side.path} stroke={`url(#strip-gradient-${index})`} style={{ filter: ambientActive ? `drop-shadow(0 0 5px ${rgbToHex(...ambientColors[index * AMBIENT_ZONES_PER_SIDE + AMBIENT_ZONES_PER_SIDE / 2])})` : state.power ? `drop-shadow(0 0 5px ${rgbToHex(...state.color)})` : undefined }} />)}
                 {ledPoints.map(([x, y], index) => {
                   const on = isLedOn(index);
                   const paintLed = (value?: boolean) => setLed(index, value);
@@ -462,6 +596,11 @@ function App() {
                     <circle cx={x} cy={y} r="7" className="led-hit" />
                   </g>;
                 })}
+                {[[150, 4], [296, 150], [150, 296], [4, 150]].map(([x, y], side) => (
+                  <text key={side} x={x} y={y} className={`direction-label ${SIDE_FACING[side] === "N" ? "north" : ""}`}
+                    transform={`rotate(${viewHeading - 180} ${x} ${y})`}>{SIDE_FACING[side]}</text>
+                ))}
+                </g>
                 <text x="150" y="142" className="square-label">4 SIDES</text>
                 <text x="150" y="159" className="square-sub-label">120 LEDs EACH</text>
               </svg>
@@ -476,6 +615,33 @@ function App() {
           </button>
           <span className="shortcut-hint">4 corner L shapes · {CORNER_ARM_LENGTH} LEDs per arm</span>
         </div>
+
+        <section className="orientation-card" aria-label="Map orientation">
+          <div className="orientation-heading">
+            <div>
+              <p className="eyebrow">Top LEDs face south · left LEDs face east</p>
+              <h2><Compass size={18} /> Orientation</h2>
+            </div>
+            <div className="mode-switch" role="radiogroup" aria-label="Orientation source">
+              <button role="radio" aria-checked={orientationMode === "compass"} className={orientationMode === "compass" ? "active" : ""} onClick={() => chooseOrientationMode("compass")} disabled={!hasOrientationSensor}>Compass</button>
+              <button role="radio" aria-checked={orientationMode === "manual"} className={orientationMode === "manual" ? "active" : ""} onClick={() => chooseOrientationMode("manual")}>Manual</button>
+            </div>
+          </div>
+          {orientationMode === "manual" || !compassActive ? (
+            <div className="orientation-manual">
+              <label htmlFor="manual-heading">{isDesktopApp ? "Facing the monitor, I look" : "Top of the screen points"}</label>
+              <select id="manual-heading" className="monitor-select" value={manualHeading} onChange={(event) => chooseManualHeading(Number(event.target.value))}>
+                {DIRECTIONS.map((direction) => <option key={direction.heading} value={direction.heading}>{direction.label}</option>)}
+              </select>
+              {orientationMode === "compass" && !compassPermission && <button className="corner-shortcut" onClick={requestCompassPermission}>Enable compass</button>}
+            </div>
+          ) : (
+            <p className="orientation-reading">Heading {Math.round(normalizeHeading(viewHeading))}° {compassPoint(viewHeading)}</p>
+          )}
+          {compassStatus ? <p className="capture-status" aria-live="polite">{compassStatus}</p>
+            : compassUnavailableReason && isTouchDevice && <p className="capture-status">{compassUnavailableReason}</p>}
+          <p className="capture-note">Ambient capture maps the screen's top edge to the {SIDE_NAMES[ambientQuarterTurns].toLowerCase()} strip ({SIDE_FACING[ambientQuarterTurns]}), so the light matches the side of the room it shows.</p>
+        </section>
 
         <section className="ambient-card" aria-label="Ambient lighting controls">
           <div className="ambient-heading">
@@ -493,9 +659,14 @@ function App() {
           </div>
           <p className="capture-status" aria-live="polite">{isAmbientDesktop ? captureStatus : "Ambient capture is available in the Linux or Windows desktop app only."}</p>
           <div className="ambient-preview">
-            {ambientColors.map((color, index) => <div key={index} className="ambient-side" style={{ backgroundColor: rgbToHex(...color) }}><span>{["Top", "Right", "Bottom", "Left"][index]}</span></div>)}
+            {SIDE_NAMES.map((name, side) => {
+              // Bottom and left zones run right→left and bottom→top; flip them to read left→right / top→bottom.
+              const zones = ambientColors.slice(side * AMBIENT_ZONES_PER_SIDE, (side + 1) * AMBIENT_ZONES_PER_SIDE);
+              const ordered = side >= 2 ? zones.reverse() : zones;
+              return <div key={side} className="ambient-side" style={{ backgroundImage: `linear-gradient(to right, ${ordered.map((color) => rgbToHex(...color)).join(", ")})` }}><span>{name} · {SIDE_FACING[side]}</span></div>;
+            })}
           </div>
-          <p className="capture-note">The desktop app captures the selected display in native Rust and sends only four sampled colors to the ESP32. Ambient controls are disabled in browsers, mobile devices, and unsupported desktop builds.</p>
+          <p className="capture-note">The desktop app captures the selected display in native Rust and sends only {AMBIENT_ZONES_PER_SIDE} sampled colors per side to the ESP32, which blends them across the LEDs. Ambient controls are disabled in browsers, mobile devices, and unsupported desktop builds.</p>
         </section>
 
         {isDesktopApp && <section className="device-card" aria-label="ESP32 connection">

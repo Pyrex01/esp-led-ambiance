@@ -52,8 +52,13 @@ const SETTINGS_SLOT_SIZE: u32 = 0x1000;
 const SETTINGS_MAGIC: u32 = 0x4C45_4453;
 const SETTINGS_RECORD_SIZE: usize = 80;
 const OTA_CHUNK_SIZE: usize = 4096;
-/// Ambient packet: type, flags, brightness, then four RGB triplets.
-const AMBIENT_PACKET_LEN: usize = 3 + 4 * 3;
+/// Ambient color zones per side, ordered clockwise like the LEDs.
+const AMBIENT_ZONES_PER_SIDE: usize = 16;
+const AMBIENT_ZONES: usize = AMBIENT_ZONES_PER_SIDE * 4;
+/// Ambient packet: type, flags, brightness, then one RGB triplet per zone.
+const AMBIENT_PACKET_LEN: usize = 3 + AMBIENT_ZONES * 3;
+const MANUAL_PACKET_LEN: usize = 6 + LED_COUNT / 8;
+const WS_MESSAGE_LEN: usize = if AMBIENT_PACKET_LEN > MANUAL_PACKET_LEN { AMBIENT_PACKET_LEN } else { MANUAL_PACKET_LEN };
 static OTA_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static LED_COLOR_POWER: AtomicU32 = AtomicU32::new(0x80FF_A500);
 static LED_EFFECT: AtomicU32 = AtomicU32::new((128 << 8) | 0);
@@ -62,7 +67,7 @@ static AMBIENT_ACTIVE: AtomicBool = AtomicBool::new(false);
 // so the 30 Hz stream never overwrites the manual settings saved to flash.
 static AMBIENT_POWERED: AtomicBool = AtomicBool::new(false);
 static AMBIENT_BRIGHTNESS: AtomicU32 = AtomicU32::new(0);
-static AMBIENT_COLORS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+static AMBIENT_COLORS: [AtomicU32; AMBIENT_ZONES] = [const { AtomicU32::new(0) }; AMBIENT_ZONES];
 // Wakes the render loop as soon as an ambient packet arrives.
 static AMBIENT_UPDATED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static LED_MASK: [AtomicU32; LED_MASK_WORDS] = [const { AtomicU32::new(u32::MAX) }; LED_MASK_WORDS];
@@ -284,16 +289,30 @@ fn fill_led_frame(frame: &mut [PulseCode], phase: u8, color_power: u32, effect: 
 fn fill_ambient_frame(frame: &mut [PulseCode]) {
     let powered = AMBIENT_POWERED.load(Ordering::Relaxed);
     let brightness = AMBIENT_BRIGHTNESS.load(Ordering::Relaxed) as u8;
-    let sides = frame[..LED_COUNT * WS2812_BITS_PER_LED].chunks_exact_mut(LEDS_PER_SIDE * WS2812_BITS_PER_LED);
-    for (side_codes, side_color) in sides.zip(&AMBIENT_COLORS) {
-        let color = if powered { side_color.load(Ordering::Relaxed) } else { 0 };
-        let channel = |shift: u32| scale(SRGB_TO_LINEAR[((color >> shift) & 0xff) as usize], brightness);
-        // Encode the side's color once and copy it to all of its LEDs.
-        let mut codes = [WS2812_ZERO; WS2812_BITS_PER_LED];
-        encode_led(&mut codes, channel(16), channel(8), channel(0));
-        for led in side_codes.chunks_exact_mut(WS2812_BITS_PER_LED) {
-            led.copy_from_slice(&codes);
+    let mut zones = [[0u8; 3]; AMBIENT_ZONES];
+    if powered {
+        for (zone, color) in zones.iter_mut().zip(&AMBIENT_COLORS) {
+            let color = color.load(Ordering::Relaxed);
+            *zone = [16, 8, 0].map(|shift| scale(SRGB_TO_LINEAR[((color >> shift) & 0xff) as usize], brightness));
         }
+    }
+    let mut previous = None;
+    let mut codes = [WS2812_ZERO; WS2812_BITS_PER_LED];
+    for led in 0..LED_COUNT {
+        // Each zone's color sits at its center; LEDs between two centers blend
+        // them in linear light. The ring wraps, so corners blend too. Position
+        // is in 1/256 zone steps.
+        let ring = AMBIENT_ZONES * 256;
+        let position = ((2 * led + 1) * AMBIENT_ZONES * 128 / LED_COUNT + ring - 128) % ring;
+        let (zone, fraction) = (position / 256, (position % 256) as u16);
+        let (from, to) = (zones[zone], zones[(zone + 1) % AMBIENT_ZONES]);
+        let rgb = [0, 1, 2].map(|channel| ((from[channel] as u16 * (256 - fraction) + to[channel] as u16 * fraction) / 256) as u8);
+        if previous != Some(rgb) {
+            encode_led(&mut codes, rgb[0], rgb[1], rgb[2]);
+            previous = Some(rgb);
+        }
+        let cursor = led * WS2812_BITS_PER_LED;
+        frame[cursor..cursor + WS2812_BITS_PER_LED].copy_from_slice(&codes);
     }
 }
 
@@ -340,9 +359,9 @@ fn fill_manual_frame(frame: &mut [PulseCode], phase: u8, color_power: u32, effec
 fn apply_ambient_packet(data: &[u8]) {
     AMBIENT_POWERED.store(data[1] & 1 != 0, Ordering::Relaxed);
     AMBIENT_BRIGHTNESS.store(data[2] as u32, Ordering::Relaxed);
-    for side in 0..4 {
-        let offset = 3 + side * 3;
-        AMBIENT_COLORS[side].store(
+    for zone in 0..AMBIENT_ZONES {
+        let offset = 3 + zone * 3;
+        AMBIENT_COLORS[zone].store(
             ((data[offset] as u32) << 16) | ((data[offset + 1] as u32) << 8) | data[offset + 2] as u32,
             Ordering::Relaxed,
         );
@@ -374,7 +393,7 @@ impl picoserve::response::ws::WebSocketCallback for LedWebSocket {
         W: picoserve::io::Write<Error = R::Error>,
     {
         tx.send_binary(&LedState::current().to_packet()).await?;
-        let mut message = [0u8; 66];
+        let mut message = [0u8; WS_MESSAGE_LEN];
         let mut ambient_ack_sent = false;
         loop {
             match rx
@@ -394,7 +413,7 @@ impl picoserve::response::ws::WebSocketCallback for LedWebSocket {
                 }
                 picoserve::futures::Either::First(Ok(
                     picoserve::response::ws::Message::Binary(data),
-                )) if data.len() == 6 + LED_COUNT / 8 => {
+                )) if data.len() == MANUAL_PACKET_LEN => {
                     AMBIENT_ACTIVE.store(false, Ordering::Relaxed);
                     let powered = data[0] != 0;
                     let color_power = ((powered as u32) << 31)

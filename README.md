@@ -64,7 +64,10 @@ Windows for `.msi`/NSIS installers.
 The Windows app can be cross-compiled from Linux with
 [cargo-xwin](https://github.com/rust-cross/cargo-xwin), which downloads the
 MSVC CRT and Windows SDK on first use. Only the NSIS installer can be produced
-this way; `.msi` bundles need a Windows machine.
+this way; `.msi` bundles need a Windows machine. The **Windows desktop build**
+GitHub Actions workflow builds both the `.msi` and NSIS installers on a Windows
+runner for pushes to `master` that touch `web/`, for `v*` tags, and on manual
+runs, and uploads them as the `windows-installers` artifact.
 
 ```sh
 sudo apt install nsis lld llvm clang

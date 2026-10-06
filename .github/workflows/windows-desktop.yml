@@ -1,0 +1,48 @@
+name: Windows desktop build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    tags: ["v*"]
+    paths:
+      - "web/**"
+      - ".github/workflows/windows-desktop.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+          cache-dependency-path: web/yarn.lock
+
+      # The repository's rust-toolchain.toml pins the ESP toolchain for the
+      # firmware; the launcher forces RUSTUP_TOOLCHAIN=stable for Tauri.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: web/src-tauri -> target
+
+      - run: yarn install --frozen-lockfile
+
+      # Tauri downloads WiX (MSI) and NSIS itself on Windows.
+      - run: yarn tauri build --target x86_64-pc-windows-msvc --bundles msi nsis
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          path: |
+            web/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            web/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error

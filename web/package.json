@@ -7,7 +7,8 @@
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "tauri": "node scripts/tauri.cjs"
+    "tauri": "node scripts/tauri.cjs",
+    "tauri:build:windows": "node scripts/tauri.cjs build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.1",

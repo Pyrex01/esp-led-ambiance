@@ -59,6 +59,26 @@ target; Wayland behavior depends on the desktop capture backend and still needs
 validation. Run `yarn tauri build` on Linux for `.deb`/AppImage bundles and on
 Windows for `.msi`/NSIS installers.
 
+### Windows build from Linux
+
+The Windows app can be cross-compiled from Linux with
+[cargo-xwin](https://github.com/rust-cross/cargo-xwin), which downloads the
+MSVC CRT and Windows SDK on first use. Only the NSIS installer can be produced
+this way; `.msi` bundles need a Windows machine.
+
+```sh
+sudo apt install nsis lld llvm clang
+rustup target add x86_64-pc-windows-msvc --toolchain stable
+cargo +stable install --locked cargo-xwin
+cd web
+yarn tauri:build:windows
+```
+
+The installer is written to
+`web/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/`, and the bare
+executable to `web/src-tauri/target/x86_64-pc-windows-msvc/release/`. Windows
+10/11 already include the WebView2 runtime the app needs.
+
 The PC averages four display-edge bands and sends at most 30 compact 14-byte
 ambient updates per second. No screenshot is sent to the ESP32. Stopping capture
 sends power off; closing the ambient WebSocket also turns the strip off. Manual

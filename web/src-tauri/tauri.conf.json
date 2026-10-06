@@ -26,7 +26,7 @@
   "bundle": {
     "active": true,
     "targets": ["deb", "appimage", "msi", "nsis"],
-    "icon": ["icons/icon.png"],
+    "icon": ["icons/icon.png", "icons/icon.ico"],
     "category": "Utility",
     "shortDescription": "Desktop companion for ESP32 ambient lighting"
   }

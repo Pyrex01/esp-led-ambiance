@@ -34,7 +34,7 @@ const DEFAULT_PRESETS: [number, number, number][] = [
   [255, 255, 255], [200, 230, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 0, 255], [255, 165, 0], [0, 255, 255],
 ];
 
-const PATTERNS = ["Solid", "Rainbow", "Pulse", "Chase", "Strobe", "Flow"];
+const PATTERNS = ["Solid", "Rainbow", "Pulse", "Chase", "Strobe", "Rainbow Chase", "Waterfall"];
 type Rgb = [number, number, number];
 
 // Ambient colors arrive as zones running clockwise around the screen, in the
@@ -537,15 +537,23 @@ function App() {
   };
   const colorAt = (index: number): [number, number, number] => {
     if (ambientActive) return ambientColorAt(ambientColors, index);
+    if ((state.pattern === 3 || state.pattern === 5) && (index + Math.floor(phase * 3)) % 24 >= 8) return [12, 14, 12];
+    if (state.pattern === 6) {
+      const distance = Math.abs(2 * (index % LEDS_PER_SIDE) + 1 - LEDS_PER_SIDE);
+      const tail = (((phase * 3 - distance * 8) % 256) + 256) % 256;
+      const head = tail < 32 ? 64 + tail * 6 : 255 - (tail - 32) * 191 / 223;
+      const envelope = Math.min(distance * 16, (LEDS_PER_SIDE - 1 - distance) * 6, 255);
+      const level = head * envelope / 255 / 255;
+      return [255, 255 - tail * 115 / 255, 255 - tail * 215 / 255].map((v) => Math.round(v * level)) as [number, number, number];
+    }
     if (state.pattern === 1 || state.pattern === 5) {
-      const hue = ((index / LED_COUNT * 360 + phase * (state.pattern === 5 ? 2.4 : 1)) % 360);
+      const hue = ((index / LED_COUNT * 360 + phase) % 360);
       const chroma = 1 - Math.abs(2 * .55 - 1);
       const x = chroma * (1 - Math.abs((hue / 60) % 2 - 1));
       const m = .55 - chroma / 2;
       const rgb = hue < 60 ? [chroma, x, 0] : hue < 120 ? [x, chroma, 0] : hue < 180 ? [0, chroma, x] : hue < 240 ? [0, x, chroma] : hue < 300 ? [x, 0, chroma] : [chroma, 0, x];
       return rgb.map((v) => Math.round((v + m) * 255)) as [number, number, number];
     }
-    if (state.pattern === 3 && (index + Math.floor(phase * 3)) % 24 >= 8) return [12, 14, 12];
     if (state.pattern === 4 && Math.floor(phase) % 16 < 8) return [12, 14, 12];
     return state.color;
   };

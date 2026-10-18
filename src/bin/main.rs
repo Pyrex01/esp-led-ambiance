@@ -269,6 +269,24 @@ fn wheel(position: u8) -> (u8, u8, u8) {
     }
 }
 
+/// Streaks pour out of the middle of each side toward both corners, one
+/// every 16 LEDs: a cool-white head with a long warm-white tail. Each streak
+/// fades in as it leaves the middle and fades out as it reaches a corner.
+fn waterfall(led: usize, phase: u8) -> (u8, u8, u8) {
+    // Distance from the middle of the side in half-LED steps: 1 beside the
+    // middle, 119 at a corner.
+    let distance = (2 * (led % LEDS_PER_SIDE) + 1).abs_diff(LEDS_PER_SIDE) as u16;
+    let tail = phase.wrapping_mul(3).wrapping_sub((distance * 8) as u8) as u16;
+    // A short rise into the head avoids a hard edge; the tail then fades.
+    let level = if tail < 32 { 64 + tail * 6 } else { 255 - (tail - 32) * 191 / 223 };
+    let span = LEDS_PER_SIDE as u16 - 1;
+    let envelope = (distance * 16).min((span - distance) * 6).min(255);
+    let level = (level * envelope / 255) as u8;
+    let green = (255 - tail * 115 / 255) as u8;
+    let blue = (255 - tail * 215 / 255) as u8;
+    (level, scale(green, level), scale(blue, level))
+}
+
 fn scale(value: u8, brightness: u8) -> u8 {
     ((value as u16 * brightness as u16) / 255) as u8
 }
@@ -337,7 +355,9 @@ fn fill_manual_frame(frame: &mut [PulseCode], phase: u8, color_power: u32, effec
             1 => wheel(((led * 256 / LED_COUNT) as u8).wrapping_add(phase)),
             3 if (led + phase as usize * 3) % 24 >= 8 => (0, 0, 0),
             4 if phase % 16 < 8 => (0, 0, 0),
-            5 => wheel(((led * 256 / LED_COUNT) as u8).wrapping_add(phase.wrapping_mul(2))),
+            5 if (led + phase as usize * 3) % 24 >= 8 => (0, 0, 0),
+            5 => wheel(((led * 256 / LED_COUNT) as u8).wrapping_add(phase)),
+            6 => waterfall(led, phase),
             _ => (red, green, blue),
         };
         let led_on = LED_MASK[led / 32].load(Ordering::Relaxed) & (1 << (led % 32)) != 0;
@@ -422,7 +442,7 @@ impl picoserve::response::ws::WebSocketCallback for LedWebSocket {
                         | data[3] as u32;
                     LED_COLOR_POWER.store(color_power, Ordering::Relaxed);
                     LED_EFFECT.store(
-                        ((data[4] as u32) << 8) | data[5].min(5) as u32,
+                        ((data[4] as u32) << 8) | data[5].min(6) as u32,
                         Ordering::Relaxed,
                     );
                     for word in 0..LED_MASK_WORDS {

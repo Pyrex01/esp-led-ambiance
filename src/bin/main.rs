@@ -269,22 +269,24 @@ fn wheel(position: u8) -> (u8, u8, u8) {
     }
 }
 
-/// Streaks pour out of the middle of each side toward both corners, one
-/// every 16 LEDs: a cool-white head with a long warm-white tail. Each streak
-/// fades in as it leaves the middle and fades out as it reaches a corner.
+/// Alternating bands of white and warm white flow out of the middle of each
+/// side toward both corners. Brightness stays constant; only the color
+/// temperature moves, blending smoothly between the two whites.
 fn waterfall(led: usize, phase: u8) -> (u8, u8, u8) {
+    const WARM: (u8, u8, u8) = (255, 160, 60);
     // Distance from the middle of the side in half-LED steps: 1 beside the
     // middle, 119 at a corner.
     let distance = (2 * (led % LEDS_PER_SIDE) + 1).abs_diff(LEDS_PER_SIDE) as u16;
-    let tail = phase.wrapping_mul(3).wrapping_sub((distance * 8) as u8) as u16;
-    // A short rise into the head avoids a hard edge; the tail then fades.
-    let level = if tail < 32 { 64 + tail * 6 } else { 255 - (tail - 32) * 191 / 223 };
-    let span = LEDS_PER_SIDE as u16 - 1;
-    let envelope = (distance * 16).min((span - distance) * 6).min(255);
-    let level = (level * envelope / 255) as u8;
-    let green = (255 - tail * 115 / 255) as u8;
-    let blue = (255 - tail * 215 / 255) as u8;
-    (level, scale(green, level), scale(blue, level))
+    // One white + warm-white cycle every 64 LEDs, moving ~17 LEDs per second.
+    let wave = ((distance * 2) as u8).wrapping_sub(phase.wrapping_mul(2));
+    let triangle = if wave < 128 { wave as u32 * 2 } else { (255 - wave) as u32 * 2 };
+    // Smoothstep turns the triangle into a cosine-like curve so bands ease
+    // into each other. Warmth only swings between 20% and 80%, so every LED
+    // is a mix of both whites and no pure patch stands out.
+    let eased = triangle * triangle * (765 - 2 * triangle) / 65025;
+    let warmth = (51 + eased * 153 / 255) as u8;
+    let mix = |warm: u8| 255 - scale(255 - warm, warmth);
+    (mix(WARM.0), mix(WARM.1), mix(WARM.2))
 }
 
 fn scale(value: u8, brightness: u8) -> u8 {
